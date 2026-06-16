@@ -3,7 +3,7 @@ use std::sync::RwLock;
 use chrono::{DateTime, Utc, NaiveDate};
 use reqwest::Client;
 use reqwest::header::{HeaderMap, HeaderValue};
-use crate::models::{NextApiQuoteResponse, NextApiDerivativesResponse, ChartCandle, HistoricalRecord};
+use crate::models::{NextApiQuoteResponse, NextApiDerivativesResponse, DerivativeContract, ChartCandle, HistoricalRecord};
 use crate::session::{load_session_cache, save_session_cache, fetch_new_cookies};
 use crate::live;
 use crate::historical;
@@ -107,6 +107,26 @@ impl NseClient {
                 }
             }
         }
+    }
+
+    /// Get only futures contracts for a symbol (filtered from the derivatives list)
+    pub async fn get_futures(&self, symbol: &str) -> Result<Vec<DerivativeContract>, Box<dyn std::error::Error + Send + Sync>> {
+        let deriv = self.get_derivatives_quote(symbol).await?;
+        let futures = deriv.data.unwrap_or_default()
+            .into_iter()
+            .filter(|c| c.instrument_type.starts_with("FUT"))
+            .collect();
+        Ok(futures)
+    }
+
+    /// Get only option chain contracts for a symbol (filtered from the derivatives list)
+    pub async fn get_option_chain(&self, symbol: &str) -> Result<Vec<DerivativeContract>, Box<dyn std::error::Error + Send + Sync>> {
+        let deriv = self.get_derivatives_quote(symbol).await?;
+        let options = deriv.data.unwrap_or_default()
+            .into_iter()
+            .filter(|c| c.instrument_type.starts_with("OPT"))
+            .collect();
+        Ok(options)
     }
 
     /// Get historical charting candles (intraday minutes or daily/weekly/monthly)

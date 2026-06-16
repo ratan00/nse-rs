@@ -6,4 +6,4 @@ pub mod archives;
 pub mod client;
 
 pub use client::NseClient;
-pub use models::{SessionCache, NextApiQuoteResponse, NextApiDerivativesResponse, ChartCandle, HistoricalRecord};
+pub use models::{SessionCache, NextApiQuoteResponse, NextApiDerivativesResponse, DerivativeContract, ChartCandle, HistoricalRecord};

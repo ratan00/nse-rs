@@ -46,6 +46,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Err(e) => println!("Error fetching derivatives quote: {}", e),
     }
 
+    // 2b. Fetch only Futures contracts
+    println!("\n--- Testing Futures Quote (NIFTY) ---");
+    match client.get_futures("NIFTY").await {
+        Ok(futures) => {
+            println!("Retrieved {} futures contracts for NIFTY.", futures.len());
+            if let Some(contract) = futures.first() {
+                println!("First Futures Contract: {}", contract.identifier);
+                println!("Expiry Date: {}", contract.expiry_date);
+                println!("Last Price: {}", contract.last_price.unwrap_or(0.0));
+            }
+        }
+        Err(e) => println!("Error fetching futures: {}", e),
+    }
+
+    // 2c. Fetch Option Chain contracts
+    println!("\n--- Testing Option Chain Quote (NIFTY) ---");
+    match client.get_option_chain("NIFTY").await {
+        Ok(options) => {
+            println!("Retrieved {} option chain contracts for NIFTY.", options.len());
+            if let Some(contract) = options.first() {
+                println!("First Options Contract: {}", contract.identifier);
+                println!("Option Type: {}", contract.option_type);
+                println!("Strike Price: {:?}", contract.strike_price);
+                println!("Expiry Date: {}", contract.expiry_date);
+                println!("Last Price: {}", contract.last_price.unwrap_or(0.0));
+            }
+        }
+        Err(e) => println!("Error fetching option chain: {}", e),
+    }
+
     // 3. Fetch historical charting data (intraday 5m candles)
     println!("\n--- Testing Intraday Charting Candles (SBIN) ---");
     let end_time = Utc::now();
