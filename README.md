@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.jpg" alt="nse-rs banner" width="50%" />
+  <img src="assets/banner.png" alt="nse-rs banner" width="100%" />
 </p>
 
 <p align="center">
