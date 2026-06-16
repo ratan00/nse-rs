@@ -10,19 +10,6 @@ This library is inspired by Python's popular `jugaad-data` and `nsemine` librari
 
 `nse-rs` is designed for high-concurrency applications, prioritizing non-blocking I/O and thread-safe shared state.
 
-```mermaid
-graph TD
-    Client[NseClient] -->|Read Lock| CookState{In-Memory Cookies Valid?}
-    CookState -->|Yes| Req[Send API Request via reqwest]
-    CookState -->|No / Expired| Fetch[Fetch New Cookies from Landing Page]
-    Fetch -->|Write Lock| Update[Update In-Memory & Disk Cache]
-    Update --> Req
-    Req -->|Success| Ret[Return Parsed Struct]
-    Req -->|403 / Decodes Error| Force[Force Session Refresh]
-    Force -->|Fetch & Lock| Retry[Retry Request Once]
-    Retry --> Ret
-```
-
 ### 1. Unified Client & Thread Safety
 The main entry point is the `NseClient` struct. It wraps:
 * A `reqwest::Client` pre-configured with realistic browser headers (User-Agent, Referer, Accept-Language, etc.) to mimic a standard desktop browser.
