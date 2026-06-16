@@ -83,6 +83,44 @@ pub async fn fetch_zipped_bhavcopy(
     Ok(records)
 }
 
+/// Fetch F&O Bhavcopy (Option chain & futures EOD data)
+/// Handles both the pre-July 2024 legacy ZIP and the post-July 2024 UDiFF ZIP formats.
+/// Returns the raw CSV text as the column structures differ wildly between the two formats.
+pub async fn fetch_fo_bhavcopy(
+    client: &Client,
+    date: NaiveDate,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let transition_date = NaiveDate::from_ymd_opt(2024, 7, 8).unwrap();
+    
+    let url = if date >= transition_date {
+        let date_str = date.format("%Y%m%d").to_string();
+        format!("{}/content/fo/BhavCopy_NSE_FO_0_0_0_{}_F_0000.csv.zip", BASE_ARCHIVES_URL, date_str)
+    } else {
+        let yyyy = date.format("%Y").to_string();
+        let mmm = date.format("%b").to_string().to_uppercase();
+        let date_upper = date.format("%d%b%Y").to_string().to_uppercase();
+        format!("{}/content/historical/DERIVATIVES/{}/{}/fo{}bhav.csv.zip", BASE_ARCHIVES_URL, yyyy, mmm, date_upper)
+    };
+    
+    let resp = client.get(&url)
+        .header(reqwest::header::ACCEPT, "*/*")
+        .send().await?;
+        
+    if !resp.status().is_success() {
+        return Err(format!("Failed to download F&O bhavcopy, status: {}", resp.status()).into());
+    }
+    
+    let bytes = resp.bytes().await?;
+    let cursor = std::io::Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(cursor)?;
+    
+    let mut file = archive.by_index(0)?;
+    let mut csv_text = String::new();
+    file.read_to_string(&mut csv_text)?;
+    
+    Ok(csv_text)
+}
+
 /// Parse full bhavcopy CSV text
 fn parse_full_bhavcopy(csv_text: &str) -> Result<Vec<HistoricalRecord>, Box<dyn std::error::Error + Send + Sync>> {
     let mut reader = csv::ReaderBuilder::new()

@@ -222,12 +222,35 @@ graph LR
 * **Functionality**: Extracts a deduplicated list of all actively trading symbols (including Equities, ETFs, Trade-to-Trade, and SMEs) from the requested date's Bhavcopy.
 * **Features**: Automatically tries the modern full delivery bhavcopy first, falling back to the legacy zipped version if necessary. It filters for relevant trading series (`EQ`, `BE`, `SM`, `MF`).
 
+#### D. Historical Option Chain Data (EOD F&O Bhavcopy)
+* **Functionality**: Fetches the end-of-day traded volume, open interest, and premiums for all derivatives (Futures & Options).
+* **Features**: Seamlessly handles the format transition that occurred on **July 8, 2024**. It will automatically fetch the legacy format for older dates and the modern UDiFF format for newer dates. Returns the raw CSV text to allow flexible parsing.
+
 #### How to Fetch:
 ```rust
-let records = client.fetch_full_bhavcopy(date).await?;
+let eq_records = client.fetch_full_bhavcopy(date).await?;
 
 // Fetch list of symbols
 let symbols = client.fetch_symbol_list(date).await?;
+
+// Fetch F&O Bhavcopy (raw CSV string)
+let fo_csv = client.fetch_fo_bhavcopy(date).await?;
+```
+
+---
+
+### 6. Market Status Tracker
+A lightweight endpoint to determine if the market is currently Open, Closed, or in a Pre-market session. Extremely useful for cron jobs or automated trading algorithms to gracefully sleep during non-market hours.
+
+* **Endpoint**: `https://www.nseindia.com/api/marketStatus`
+* **Rust Representation**: `MarketStatusResponse`
+
+#### How to Fetch:
+```rust
+let status = client.get_market_status().await?;
+for state in status.market_state {
+    println!("{}: {}", state.market, state.market_status); // e.g. "Capital Market: Closed"
+}
 ```
 
 ---

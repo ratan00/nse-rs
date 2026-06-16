@@ -119,5 +119,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Err(e) => println!("Error fetching zipped Bhavcopy: {}", e),
     }
 
+    // 6. Fetch market status
+    println!("\n--- Testing Market Status ---");
+    match client.get_market_status().await {
+        Ok(status) => {
+            println!("Retrieved Market Status!");
+            for state in status.market_state.iter().take(2) {
+                println!("{}: {}", state.market, state.market_status);
+            }
+        }
+        Err(e) => println!("Error fetching market status: {}", e),
+    }
+
+    // 7. Fetch F&O Bhavcopy
+    println!("\n--- Testing F&O Bhavcopy ---");
+    let fo_date = NaiveDate::from_ymd_opt(2026, 6, 15).unwrap();
+    match client.fetch_fo_bhavcopy(fo_date).await {
+        Ok(csv) => {
+            println!("Downloaded F&O Bhavcopy for 2026-06-15.");
+            println!("First 100 chars of CSV: {:?}", &csv.chars().take(100).collect::<String>());
+        }
+        Err(e) => println!("Error fetching F&O Bhavcopy: {}", e),
+    }
+
     Ok(())
 }

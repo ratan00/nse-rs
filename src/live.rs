@@ -5,6 +5,23 @@ use crate::models::{NextApiQuoteResponse, NextApiDerivativesResponse};
 use crate::session::format_cookie_header;
 
 const NEXT_API_URL: &str = "https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi";
+const MARKET_STATUS_URL: &str = "https://www.nseindia.com/api/marketStatus";
+
+/// Fetch the current market status (Open, Closed, Pre-market)
+pub async fn get_market_status(
+    client: &Client,
+    cookies: &HashMap<String, String>,
+) -> Result<crate::models::MarketStatusResponse, reqwest::Error> {
+    let cookie_val = format_cookie_header(cookies);
+    
+    let resp = client.get(MARKET_STATUS_URL)
+        .header(COOKIE, cookie_val)
+        .send()
+        .await?;
+        
+    let response_data = resp.json::<crate::models::MarketStatusResponse>().await?;
+    Ok(response_data)
+}
 
 /// Fetch live equity quote data for a symbol (e.g. "SBIN", "RELIANCE")
 pub async fn get_stock_quote(

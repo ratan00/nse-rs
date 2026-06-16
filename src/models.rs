@@ -136,6 +136,27 @@ pub struct ChartCandle {
 }
 
 // ==========================================
+// Market Status Models
+// ==========================================
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MarketStatusResponse {
+    #[serde(rename = "marketState")]
+    pub market_state: Vec<MarketState>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MarketState {
+    pub market: String,
+    #[serde(rename = "marketStatus")]
+    pub market_status: String,
+    #[serde(rename = "tradeDate")]
+    pub trade_date: String,
+    #[serde(rename = "marketStatusMessage")]
+    pub market_status_message: Option<String>,
+}
+
+// ==========================================
 // CSV/Bhavcopy Output Record
 // ==========================================
 

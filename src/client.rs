@@ -165,6 +165,31 @@ impl NseClient {
     pub async fn fetch_symbol_list(&self, date: NaiveDate) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         archives::fetch_symbol_list(&self.client, date).await
     }
+
+    /// Check current market status (Open, Closed, Pre-market)
+    pub async fn get_market_status(&self) -> Result<crate::models::MarketStatusResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let cookies = self.cookies.read().map_err(|e| format!("Lock error: {}", e))?.clone();
+        
+        match live::get_market_status(&self.client, &cookies).await {
+            Ok(res) => Ok(res),
+            Err(e) => {
+                if e.is_status() || e.is_decode() {
+                    self.force_refresh_session().await?;
+                    let fresh_cookies = self.cookies.read().map_err(|e| format!("Lock error: {}", e))?.clone();
+                    let retry_res = live::get_market_status(&self.client, &fresh_cookies).await?;
+                    Ok(retry_res)
+                } else {
+                    Err(Box::new(e))
+                }
+            }
+        }
+    }
+
+    /// Download Historical Option Chain Data (EOD F&O Bhavcopy)
+    /// Returns the raw CSV text since the file formats vary between dates.
+    pub async fn fetch_fo_bhavcopy(&self, date: NaiveDate) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        archives::fetch_fo_bhavcopy(&self.client, date).await
+    }
 }
 
 impl Default for NseClient {
