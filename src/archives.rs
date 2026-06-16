@@ -26,6 +26,28 @@ pub async fn fetch_full_bhavcopy(
     Ok(records)
 }
 
+/// Fetch a master list of all actively trading symbols for a given date
+pub async fn fetch_symbol_list(
+    client: &Client,
+    date: NaiveDate,
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let records = match fetch_full_bhavcopy(client, date).await {
+        Ok(r) => r,
+        Err(_) => fetch_zipped_bhavcopy(client, date).await?,
+    };
+    
+    let mut symbols: Vec<String> = records
+        .into_iter()
+        .filter(|r| r.series == "EQ" || r.series == "BE" || r.series == "SM" || r.series == "MF")
+        .map(|r| r.symbol)
+        .collect();
+        
+    symbols.sort();
+    symbols.dedup();
+    
+    Ok(symbols)
+}
+
 /// Fetch standard zipped bhavcopy (no delivery data, but covers older historical dates)
 /// URL: https://nsearchives.nseindia.com/content/historical/EQUITIES/YYYY/MMM/cmDDMMM[YYYY]bhav.csv.zip
 pub async fn fetch_zipped_bhavcopy(

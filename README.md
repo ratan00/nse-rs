@@ -218,9 +218,16 @@ graph LR
 * **URL Structure**: `https://nsearchives.nseindia.com/content/historical/EQUITIES/YYYY/MMM/cmDDMMM[YYYY]bhav.csv.zip`
 * **Features**: The client downloads the `.zip` binary over HTTP, reads the ZIP directory, and decompresses the inner CSV **entirely in-memory** using the `zip` crate. No file is ever written to disk.
 
+#### C. Master Symbol List
+* **Functionality**: Extracts a deduplicated list of all actively trading symbols (including Equities, ETFs, Trade-to-Trade, and SMEs) from the requested date's Bhavcopy.
+* **Features**: Automatically tries the modern full delivery bhavcopy first, falling back to the legacy zipped version if necessary. It filters for relevant trading series (`EQ`, `BE`, `SM`, `MF`).
+
 #### How to Fetch:
 ```rust
 let records = client.fetch_full_bhavcopy(date).await?;
+
+// Fetch list of symbols
+let symbols = client.fetch_symbol_list(date).await?;
 ```
 
 ---

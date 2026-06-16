@@ -160,6 +160,11 @@ impl NseClient {
     pub async fn fetch_zipped_bhavcopy(&self, date: NaiveDate) -> Result<Vec<HistoricalRecord>, Box<dyn std::error::Error + Send + Sync>> {
         archives::fetch_zipped_bhavcopy(&self.client, date).await
     }
+
+    /// Fetch a master list of all actively trading symbols for a given date
+    pub async fn fetch_symbol_list(&self, date: NaiveDate) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        archives::fetch_symbol_list(&self.client, date).await
+    }
 }
 
 impl Default for NseClient {
