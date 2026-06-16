@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.png" alt="nse-rs banner" width="100%" />
+  <img src="assets/banner.png" alt="nse-rs banner" width="90%" />
 </p>
 
 <p align="center">
@@ -12,8 +12,6 @@
 
 `nse-rs` is a high-performance, async-first Rust library designed to fetch live equity quotes, futures, options, intraday charting candles, and historical EOD Bhavcopy archives from the National Stock Exchange of India (NSE). 
 
-
-This library is inspired by Python's popular `jugaad-data` and `nsemine` libraries, rewritten from the ground up in pure Rust for type safety, zero-cost abstractions, multi-threaded safety, and low resource overhead.
 
 ---
 
@@ -266,6 +264,8 @@ cargo run --example demo
 ```
 
 ---
+Credits:
+This library is inspired by Python's popular `jugaad-data` and `nsemine` libraries, rewritten from the ground up in pure Rust for type safety, zero-cost abstractions, multi-threaded safety, and low resource overhead.
 
 ## 📄 License
 
