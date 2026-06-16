@@ -20,11 +20,6 @@ To prevent IP blocks and minimize overhead, the client uses a disk-and-memory ca
 * **Disk Cache**: Sessions are persisted to disk at `~/.cache/nse-rs/session.json` (or the equivalent OS-specific cache folder resolved via the `dirs` crate).
 * **TTL Check**: Before sending a request, the client checks if the cached session exists and is less than 1 hour old. If valid, it loads the cookies into memory without calling the NSE landing page.
 * **Automatic Cookie Rotation**: If a session has expired (TTL > 1 hour) or a request returns a `403 Forbidden` or a payload decoding error (typical of expired sessions), `NseClient` performs an automated session refresh:
-  1. Requests the NSE landing page: `https://www.nseindia.com/get-quote/equity/RELIANCE/Reliance-Industries-Limited`
-  2. Extracts cookies from the `Set-Cookie` headers.
-  3. Writes them back to the disk cache.
-  4. Acquires an exclusive write lock on the in-memory cookie storage to update it.
-  5. Retries the failed request.
 
 ### 3. Light Compilation footprint (Zero OpenSSL dependencies)
 By using `rustls-tls-native-roots`, the crate avoids dependency on local OpenSSL library binaries, simplifying cross-compilation (e.g. compiling for AWS Lambda or Docker scratch containers).
