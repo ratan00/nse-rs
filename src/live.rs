@@ -9,7 +9,7 @@ use crate::session::format_cookie_header;
 
 const NEXT_API_URL: &str    = "https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi";
 const MARKET_STATUS_URL: &str = "https://www.nseindia.com/api/marketStatus";
-const INDEX_API_URL: &str   = "https://www.nseindia.com/api/indices";
+const INDEX_API_URL: &str   = "https://www.nseindia.com/api/allIndices";
 
 pub async fn get_market_status(
     client: &Client,
@@ -84,7 +84,6 @@ pub async fn get_index_quote(
     let resp: IndexApiResponse = client
         .get(INDEX_API_URL)
         .header(COOKIE, cookie_val)
-        .query(&[("index", index_name)])
         .send()
         .await
         .context("index request")?
@@ -96,7 +95,7 @@ pub async fn get_index_quote(
         .data
         .unwrap_or_default()
         .into_iter()
-        .next()
+        .find(|e| e.index_symbol.eq_ignore_ascii_case(index_name))
         .with_context(|| format!("no data for index '{index_name}'"))?;
 
     Ok(NseIndexQuote {

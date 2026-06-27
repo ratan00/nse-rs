@@ -147,7 +147,7 @@ pub struct RawIndexEntry {
     #[serde(rename = "high",        default)] pub high:       f64,
     #[serde(rename = "low",         default)] pub low:        f64,
     #[serde(rename = "previousClose",default)]pub prev_close: f64,
-    #[serde(rename = "change",      default)] pub change:     f64,
+    #[serde(rename = "variation",    default)] pub change:     f64,
     #[serde(rename = "percentChange",default)]pub change_pct: f64,
 }
 
