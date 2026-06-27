@@ -36,6 +36,7 @@ impl NseClient {
 
         let client = Client::builder()
             .default_headers(headers)
+            .cookie_store(true)
             .timeout(Duration::from_secs(15))
             .build()
             .unwrap_or_default();
