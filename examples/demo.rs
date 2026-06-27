@@ -14,16 +14,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("\n--- Testing Stock Quote (SBIN) ---");
     match client.get_stock_quote("SBIN").await {
         Ok(quote) => {
-            if let Some(resp) = quote.equity_response {
-                if let Some(first) = resp.first() {
-                    let symbol = first.meta_data.as_ref().map(|m| m.symbol.as_str()).unwrap_or("Unknown");
-                    let ltp = first.trade_info.as_ref().and_then(|t| t.last_price).unwrap_or(0.0);
-                    let name = first.meta_data.as_ref().and_then(|m| m.company_name.as_deref()).unwrap_or("");
-                    println!("Stock Symbol: {}", symbol);
-                    println!("Company Name: {}", name);
-                    println!("Last Traded Price: {}", ltp);
-                }
-            }
+            println!("Stock Symbol: {}", quote.symbol);
+            println!("Company Name: {}", quote.company_name);
+            println!("Last Traded Price: {}", quote.ltp);
         }
         Err(e) => println!("Error fetching stock quote: {}", e),
     }
@@ -64,13 +57,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("\n--- Testing Option Chain Quote (NIFTY) ---");
     match client.get_option_chain("NIFTY").await {
         Ok(options) => {
-            println!("Retrieved {} option chain contracts for NIFTY.", options.len());
-            if let Some(contract) = options.first() {
-                println!("First Options Contract: {}", contract.identifier);
-                println!("Option Type: {}", contract.option_type);
-                println!("Strike Price: {:?}", contract.strike_price);
-                println!("Expiry Date: {}", contract.expiry_date);
-                println!("Last Price: {}", contract.last_price.unwrap_or(0.0));
+            println!("Retrieved option chain for NIFTY. Expiry dates count: {}", options.expiries.len());
+            if let Some((expiry, rows)) = options.expiries.iter().next() {
+                println!("First Expiry: {}", expiry);
+                if let Some(row) = rows.first() {
+                    println!("First Strike: {}", row.strike);
+                    println!("CE LTP: {}", row.ce.ltp);
+                    println!("PE LTP: {}", row.pe.ltp);
+                }
             }
         }
         Err(e) => println!("Error fetching option chain: {}", e),
@@ -135,9 +129,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("\n--- Testing F&O Bhavcopy ---");
     let fo_date = NaiveDate::from_ymd_opt(2026, 6, 15).unwrap();
     match client.fetch_fo_bhavcopy(fo_date).await {
-        Ok(csv) => {
-            println!("Downloaded F&O Bhavcopy for 2026-06-15.");
-            println!("First 100 chars of CSV: {:?}", &csv.chars().take(100).collect::<String>());
+        Ok(records) => {
+            println!("Downloaded F&O Bhavcopy for 2026-06-15: {} records.", records.len());
+            if let Some(rec) = records.first() {
+                println!("First F&O Record: {:?}", rec);
+            }
         }
         Err(e) => println!("Error fetching F&O Bhavcopy: {}", e),
     }

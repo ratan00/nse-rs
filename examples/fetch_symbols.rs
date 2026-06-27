@@ -5,6 +5,7 @@ use nse_rs::NseClient;
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = NseClient::new();
     
+    // Note: Archives/bhavcopy endpoints do not require session cookie initialization.
     // Try dates going backwards to find the latest available bhavcopy
     let current_date = Local::now().date_naive();
     let mut symbols = Vec::new();
