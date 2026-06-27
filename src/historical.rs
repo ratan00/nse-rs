@@ -35,10 +35,11 @@ pub async fn get_script_token(
     symbol: &str,
 ) -> Result<(String, String, String)> {
     let cookie_val = format_cookie_header(cookies);
+    let sym_upper = symbol.to_uppercase();
     let resp: SymbolSearchResponse = client
         .get(SEARCH_TOKEN_URL)
         .header(COOKIE, cookie_val)
-        .query(&[("segment", ""), ("symbol", symbol)])
+        .query(&[("segment", ""), ("symbol", &sym_upper)])
         .send()
         .await
         .context("symbol search request")?
