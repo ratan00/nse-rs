@@ -10,293 +10,251 @@
 
 # nse-rs
 
-`nse-rs` is a high-performance, async-first Rust library designed to fetch live equity quotes, futures, options, intraday charting candles, and historical EOD Bhavcopy archives from the National Stock Exchange of India (NSE). 
+An async Rust library for fetching live market data from the National Stock Exchange of India (NSE) — no API key or account required.
 
-
----
-
-## ⚡ Async Architecture & Design
-
-`nse-rs` is designed for high-concurrency applications, prioritizing non-blocking I/O and thread-safe shared state.
-
-### 1. Unified Client & Thread Safety
-The main entry point is the `NseClient` struct. It wraps:
-* A `reqwest::Client` pre-configured with realistic browser headers (User-Agent, Referer, Accept-Language, etc.) to mimic a standard desktop browser.
-* An `RwLock<HashMap<String, String>>` storing cookie keys (like `nsit`, `nseappid`, etc.). This allows multiple threads to read cached cookies concurrently without contention, while restricting access only during an active cookie refresh.
-
-### 2. Double-Layered Session Caching
-To prevent IP blocks and minimize overhead, the client uses a disk-and-memory caching mechanism:
-* **Disk Cache**: Sessions are persisted to disk at `~/.cache/nse-rs/session.json` (or the equivalent OS-specific cache folder resolved via the `dirs` crate).
-* **TTL Check**: Before sending a request, the client checks if the cached session exists and is less than 1 hour old. If valid, it loads the cookies into memory without calling the NSE landing page.
-* **Automatic Cookie Rotation**: If a session has expired (TTL > 1 hour) or a request returns a `403 Forbidden` or a payload decoding error (typical of expired sessions), `NseClient` performs an automated session refresh:
-
-### 3. Light Compilation footprint (Zero OpenSSL dependencies)
-By using `rustls-tls-native-roots`, the crate avoids dependency on local OpenSSL library binaries, simplifying cross-compilation (e.g. compiling for AWS Lambda or Docker scratch containers).
+Provides live equity quotes, index quotes, structured option chains, futures, intraday & historical candles, polling feed loops, and EOD bhavcopy archives.
 
 ---
 
-## 📈 Feature Deep-Dive & Data Schemas
+## Features
 
-### 1. Live Stock Quotes (NextApi)
-Live equity data is fetched from the NSE NextApi quotes endpoint.
-
-* **Endpoint**: `https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi`
-* **Query Params**: `functionName=getSymbolData`, `marketType=N`, `series=EQ`, `symbol=<SYMBOL>`
-* **Rust Representation**: [`NextApiQuoteResponse`](file:///home/spidy/Documents/OT6.4/nse-rs/src/models.rs#L14-L18)
-
-#### How to Fetch:
-```rust
-let quote = client.get_stock_quote("SBIN").await?;
-```
-
-#### Example JSON Response Structure
-```json
-{
-  "equityResponse": [
-    {
-      "metaData": {
-        "symbol": "SBIN",
-        "companyName": "State Bank of India",
-        "series": "EQ",
-        "open": 845.0,
-        "dayHigh": 849.9,
-        "dayLow": 835.1,
-        "previousClose": 843.9,
-        "change": -4.7,
-        "closePrice": 839.2,
-        "pChange": -0.56
-      },
-      "priceInfo": {
-        "yearHigh": 912.0,
-        "yearLow": 550.0,
-        "lowerBand": 759.5,
-        "upperBand": 928.2
-      },
-      "tradeInfo": {
-        "totalTradedVolume": 12903496.0,
-        "totalTradedValue": 108634.38,
-        "lastPrice": 839.2
-      },
-      "secInfo": {
-        "isinCode": "INE062A01020",
-        "industry": "Banks",
-        "sector": "Financial Services"
-      },
-      "lastUpdateTime": "16-Jun-2026 15:30:00"
-    }
-  ]
-}
-```
+- **Live equity quotes** — flat `NseQuote` with LTP, OHLCV, change, volume
+- **Live index quotes** — NIFTY 50, NIFTY BANK, FINNIFTY etc. via `get_index_quote()`
+- **Structured option chain** — `OptionChain` grouped by expiry date → strike → CE/PE
+- **Futures** — all contracts for a symbol filtered from derivatives
+- **Historical candles** — 1/3/5/15/30/60 min intraday (30-day window) or D/W/M (25+ years)
+- **Polling feed** — `poll_quote()` and `poll_index()` loops for simulated live streaming
+- **EOD bhavcopy** — equity and F&O archives parsed into typed structs
+- **Script token cache** — symbol → charting token cached in memory; no double-requests
+- **Auto session retry** — cookie refresh on 403/decode failures, disk-cached for 1 hour
+- **No OpenSSL** — uses `rustls-tls-native-roots`; cross-compiles cleanly
 
 ---
 
-### 2. Live Futures (Derivatives)
-Fetches live Futures contracts for indices (e.g. NIFTY, BANKNIFTY) or stocks.
-
-* **Endpoint**: `https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi`
-* **Query Params**: `functionName=getSymbolDerivativesData`, `symbol=<SYMBOL>`
-* **Rust Representation**: [`NextApiDerivativesResponse`](file:///home/spidy/Documents/OT6.4/nse-rs/src/models.rs#L88-L92)
-
-#### How to Fetch:
-```rust
-let futures = client.get_futures("NIFTY").await?;
-```
-
-#### Example Futures JSON Response Structure
-```json
-[
-  {
-    "identifier": "FUTIDXNIFTY25JUN2026",
-    "instrumentType": "FUTIDX",
-    "underlying": "NIFTY",
-    "expiryDate": "25-Jun-2026",
-    "optionType": "-",
-    "strikePrice": 0,
-    "lastPrice": 23450.75,
-    "openInterest": 125400.0,
-    "changeinOpenInterest": 1200.0,
-    "pchangeinOpenInterest": 0.96,
-    "totalTradedVolume": 45000.0,
-    "volume": 105528.3
-  }
-]
-```
-
----
-
-### 3. Live Option Chains
-Fetches live Option Chain contracts for indices (e.g. NIFTY, BANKNIFTY) or stocks.
-
-* **Endpoint**: `https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi`
-* **Query Params**: `functionName=getSymbolDerivativesData`, `symbol=<SYMBOL>`
-* **Rust Representation**: [`NextApiDerivativesResponse`](file:///home/spidy/Documents/OT6.4/nse-rs/src/models.rs#L88-L92)
-
-#### How to Fetch:
-```rust
-let option_chain = client.get_option_chain("NIFTY").await?;
-```
-
-#### Example Option Chain JSON Response Structure
-```json
-[
-  {
-    "identifier": "OPTIDXNIFTY16-06-2026CE24000.00",
-    "instrumentType": "OPTIDX",
-    "underlying": "NIFTY",
-    "expiryDate": "16-Jun-2026",
-    "optionType": "CE",
-    "strikePrice": "   24000.00",
-    "lastPrice": 0.05,
-    "openInterest": 611314.0,
-    "changeinOpenInterest": 15400.0,
-    "pchangeinOpenInterest": 2.58,
-    "totalTradedVolume": 185000.0,
-    "volume": 435200.5
-  }
-]
-```
-
----
-
-### 4. Historical Intraday Charting (Interactive)
-The library fetches historical tick data/candles directly from NSE's interactive charting microservices.
-
-* **Endpoints**:
-  1. **Dynamic search**: `https://charting.nseindia.com/v1/exchanges/symbolsDynamic?segment=&symbol=<SYMBOL>` to resolve the symbol's exact `scripcode` (referred to as `token` in the charting API).
-  2. **Historical Data**: `https://charting.nseindia.com/v1/charts/symbolHistoricalData`
-* **Rust Representation**: [`ChartCandle`](file:///home/spidy/Documents/OT6.4/nse-rs/src/models.rs#L129-L137)
-
-#### Timestamp shifting & market Hours filter
-1. **IST Time Shift**: The charting API requires the start/end parameters as epoch timestamps reflecting the Indian Standard Time (IST) offset (+5.5 hours). For intraday calls, `nse-rs` automatically adds `19800` seconds to the requested UTC timestamps before sending the query.
-2. **Pre/Post-Market Filter**: Intraday ticks returned by NSE charting services often contain pre-market orders or block trade outliers outside the standard session. `nse-rs` automatically parses the millisecond timestamp of every candle back into IST and retains **only** candles between **09:15:00** and **15:30:00** IST.
-
-#### Supported Intervals & Limits
-* **Intraday Minutes** (`"1"`, `"3"`, `"5"`, `"15"`, `"30"`, `"60"`): **Strictly capped at a maximum history of 30 calendar days** from the current date. Any query requesting start dates beyond this window is automatically truncated by the NSE server.
-* **Historical Daily/Weekly/Monthly** (`"D"`, `"W"`, `"M"`): Virtually unlimited history, returning **25+ years of data** (extending back to June 2001) in a single request.
-
-#### How to Fetch:
-```rust
-let candles = client.get_historical_candles("SBIN", start_time, end_time, "5").await?;
-```
-
-#### Example Candle Structure
-```json
-{
-  "time": 1781601300000,
-  "open": 843.50,
-  "high": 845.20,
-  "low": 843.10,
-  "close": 844.75,
-  "volume": 45120.0
-}
-```
-
----
-
-### 5. Bulk Bhavcopy EOD Summaries
-Bhavcopies are Daily End-of-Day (EOD) files covering all equities listed on the exchange. `nse-rs` supports two formats depending on the era of the historical date requested:
-
-```mermaid
-graph LR
-    Date[Date Input] --> DateCheck{Date >= July 8, 2024?}
-    DateCheck -->|Yes| Full[fetch_full_bhavcopy]
-    DateCheck -->|No| Zip[fetch_zipped_bhavcopy]
-    Full -->|UDiff CSV| ParseFull[Parse full CSV columns]
-    Zip -->|Zip Archive| Memory[Decompress ZIP in-memory]
-    Memory -->|Standard CSV| ParseZip[Parse legacy CSV columns]
-    ParseFull --> Out[Vec<HistoricalRecord>]
-    ParseZip --> Out
-```
-
-#### A. Modern Full Bhavcopy (UDiff)
-* **Availability**: For trading dates **on or after July 8, 2024**.
-* **URL Structure**: `https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_DDMMYYYY.csv`
-* **Features**: Mapped directly from UDiff CSV values (includes delivery details).
-
-#### B. Legacy Zipped Bhavcopy
-* **Availability**: For historical trading dates **prior to July 8, 2024** (extending back to the early 2000s).
-* **URL Structure**: `https://nsearchives.nseindia.com/content/historical/EQUITIES/YYYY/MMM/cmDDMMM[YYYY]bhav.csv.zip`
-* **Features**: The client downloads the `.zip` binary over HTTP, reads the ZIP directory, and decompresses the inner CSV **entirely in-memory** using the `zip` crate. No file is ever written to disk.
-
-#### C. Master Symbol List
-* **Functionality**: Extracts a deduplicated list of all actively trading symbols (including Equities, ETFs, Trade-to-Trade, and SMEs) from the requested date's Bhavcopy.
-* **Features**: Automatically tries the modern full delivery bhavcopy first, falling back to the legacy zipped version if necessary. It filters for relevant trading series (`EQ`, `BE`, `SM`, `MF`).
-
-#### D. Historical Option Chain Data (EOD F&O Bhavcopy)
-* **Functionality**: Fetches the end-of-day traded volume, open interest, and premiums for all derivatives (Futures & Options).
-* **Features**: Seamlessly handles the format transition that occurred on **July 8, 2024**. It will automatically fetch the legacy format for older dates and the modern UDiFF format for newer dates. Returns the raw CSV text to allow flexible parsing.
-
-#### How to Fetch:
-```rust
-let eq_records = client.fetch_full_bhavcopy(date).await?;
-
-// Fetch list of symbols
-let symbols = client.fetch_symbol_list(date).await?;
-
-// Fetch F&O Bhavcopy (raw CSV string)
-let fo_csv = client.fetch_fo_bhavcopy(date).await?;
-```
-
----
-
-### 6. Market Status Tracker
-A lightweight endpoint to determine if the market is currently Open, Closed, or in a Pre-market session. Extremely useful for cron jobs or automated trading algorithms to gracefully sleep during non-market hours.
-
-* **Endpoint**: `https://www.nseindia.com/api/marketStatus`
-* **Rust Representation**: `MarketStatusResponse`
-
-#### How to Fetch:
-```rust
-let status = client.get_market_status().await?;
-for state in status.market_state {
-    println!("{}: {}", state.market, state.market_status); // e.g. "Capital Market: Closed"
-}
-```
-
----
-
-## 🚫 Cloud Blocks & Proxy Considerations
-
-> [!WARNING]
-> The primary domain `www.nseindia.com` (which hosts live stock quotes, options chains, and historical charting) implements strict firewall policies (Akamai and Cloudflare). 
-> 
-> * **Geo-Blocking**: Requests originating from IPs outside India are frequently blocked with a `403 Forbidden` or instant TCP resets.
-> * **Data Center Blocking**: IPs associated with public cloud services (AWS, GCP, DigitalOcean, Azure, Hetzner, etc.) are actively blacklisted, even if the region is in India (e.g. `ap-south-1`).
-> 
-> **How to bypass this:**
-> 1. Run the live scrapers from a residential/domestic internet connection in India.
-> 2. Configure residential proxies on the client or environment level.
-> 
-> *Note: The historical EOD archive domain `nsearchives.nseindia.com` does not have these blocks, meaning bulk Bhavcopies can be downloaded globally from any cloud provider.*
-
----
-
-## 📦 Installation
-
-Add this to your project's `Cargo.toml`:
+## Installation
 
 ```toml
 [dependencies]
 nse-rs = { git = "https://github.com/ratan00/nse-rs.git" }
-tokio = { version = "1.38", features = ["full"] }
+tokio  = { version = "1", features = ["full"] }
 chrono = "0.4"
 ```
 
 ---
 
-## 💡 Complete Usage Example
+## Quick Start
 
-A complete, ready-to-run implementation example showcasing the client lifecycle and all available endpoints is located in the [examples/](file:///home/spidy/Documents/OT6.4/nse-rs/examples) directory.
+```rust
+use nse_rs::NseClient;
 
-You can run it directly from the workspace:
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let client = NseClient::new();
+    client.init_session().await?;
+
+    // Flat live quote
+    let quote = client.get_stock_quote("RELIANCE").await?;
+    println!("{}: LTP ₹{:.2}  vol {}", quote.symbol, quote.ltp, quote.volume);
+
+    // Index spot price
+    let nifty = client.get_index_quote("NIFTY 50").await?;
+    println!("NIFTY 50: {:.2}  ({:+.2}%)", nifty.last, nifty.change_pct);
+
+    // Structured option chain
+    let chain = client.get_option_chain("NIFTY").await?;
+    for (expiry, rows) in &chain.expiries {
+        println!("=== {} ===", expiry);
+        for row in rows.iter().take(3) {
+            println!("  {:>8.0}  CE {:.2}  PE {:.2}",
+                row.strike, row.ce.ltp, row.pe.ltp);
+        }
+    }
+
+    Ok(())
+}
+```
+
+---
+
+## API Reference
+
+### `NseClient`
+
+Create with `NseClient::new()`, then call `init_session().await?` before any data fetch.
+
+#### Live data
+
+| Method | Returns | Description |
+|---|---|---|
+| `get_stock_quote(symbol)` | `NseQuote` | Flat live quote for an equity (e.g. `"SBIN"`) |
+| `get_index_quote(index_name)` | `NseIndexQuote` | Spot for an index (e.g. `"NIFTY 50"`, `"NIFTY BANK"`) |
+| `get_option_chain(symbol)` | `OptionChain` | All options grouped by expiry/strike with CE+PE |
+| `get_futures(symbol)` | `Vec<DerivativeContract>` | All futures contracts |
+| `get_option_contracts(symbol)` | `Vec<DerivativeContract>` | Raw option contracts (unstructured) |
+| `get_derivatives_quote(symbol)` | `NextApiDerivativesResponse` | Full raw derivatives response |
+| `get_market_status()` | `MarketStatusResponse` | Open / Closed / Pre-market |
+
+#### Polling feed
+
+```rust
+use tokio::sync::mpsc;
+
+let (tx, mut rx) = mpsc::channel(64);
+
+// Spawn a polling loop — sends a NseQuote every 3 seconds
+tokio::spawn(async move {
+    client.poll_quote("INFY", 3_000, tx).await;
+});
+
+while let Some(q) = rx.recv().await {
+    println!("{}: ₹{:.2}", q.symbol, q.ltp);
+}
+```
+
+`poll_index("NIFTY 50", interval_ms, tx)` works the same way for indices.
+
+Both loops stop automatically when the receiver is dropped.
+
+#### Historical candles
+
+```rust
+use chrono::Utc;
+
+let end   = Utc::now();
+let start = end - chrono::Duration::days(5);
+
+// 5-minute intraday candles (market hours only, auto-filtered)
+let candles = client.get_historical_candles("SBIN", start, end, "5").await?;
+
+// Daily candles going back years
+let daily = client.get_historical_candles("NIFTY", start, end, "D").await?;
+```
+
+Supported intervals: `"1"` `"3"` `"5"` `"15"` `"30"` `"60"` (minutes, max 30-day window) or `"D"` `"W"` `"M"` (unlimited history).
+
+Intraday candles are automatically filtered to 09:15–15:30 IST.
+
+#### EOD archives
+
+```rust
+use chrono::NaiveDate;
+
+let date = NaiveDate::from_ymd_opt(2025, 6, 20).unwrap();
+
+// Equity bhavcopy
+let records = client.fetch_full_bhavcopy(date).await?;
+
+// All actively trading symbol names for a date
+let symbols = client.fetch_symbol_list(date).await?;
+
+// F&O bhavcopy — typed structs, both pre/post July-2024 formats
+let fo = client.fetch_fo_bhavcopy(date).await?;
+for rec in fo.iter().take(5) {
+    println!("{} {} {} @ {:.2}  OI {}", rec.symbol, rec.expiry, rec.option_type, rec.strike, rec.oi);
+}
+```
+
+---
+
+## Key Types
+
+### `NseQuote`
+```rust
+pub struct NseQuote {
+    pub symbol:       String,
+    pub company_name: String,
+    pub ltp:          f64,
+    pub open:         f64,
+    pub high:         f64,
+    pub low:          f64,
+    pub prev_close:   f64,
+    pub close:        f64,
+    pub change:       f64,
+    pub change_pct:   f64,
+    pub volume:       f64,
+    pub traded_value: f64,
+    pub year_high:    f64,
+    pub year_low:     f64,
+    pub last_update:  String,
+}
+```
+
+### `OptionChain`
+```rust
+pub struct OptionChain {
+    pub symbol:   String,
+    // expiry date string → rows sorted by strike ascending
+    pub expiries: BTreeMap<String, Vec<OptionChainRow>>,
+}
+
+pub struct OptionChainRow {
+    pub strike: f64,
+    pub ce:     OptionSide,
+    pub pe:     OptionSide,
+}
+
+pub struct OptionSide {
+    pub ltp:          f64,
+    pub oi:           f64,
+    pub change_in_oi: f64,
+    pub volume:       f64,
+}
+```
+
+### `FoBhavRecord`
+```rust
+pub struct FoBhavRecord {
+    pub symbol:          String,
+    pub expiry:          String,
+    pub instrument_type: String, // "FUTIDX", "OPTIDX", "FUTSTK", "OPTSTK"
+    pub option_type:     String, // "CE", "PE", or "-"
+    pub strike:          f64,
+    pub open:            f64,
+    pub high:            f64,
+    pub low:             f64,
+    pub close:           f64,
+    pub settle_price:    f64,
+    pub contracts:       u64,
+    pub oi:              u64,
+    pub change_in_oi:    i64,
+}
+```
+
+---
+
+## Session & Cookie Management
+
+NSE's web APIs require browser cookies (`nsit`, `nseappid`, etc.) obtained by hitting their landing page. `nse-rs` handles this transparently:
+
+1. **Disk cache** at `~/.cache/nse-rs/session.json` — reused for up to 1 hour across process restarts
+2. **Auto-refresh** — if a request returns a 403 or a decode error, the session is refreshed once and the request retried automatically
+3. **Force refresh** — call `client.force_refresh_session().await?` to discard and re-fetch
+
+---
+
+## ⚠️ Cloud & Geo Restrictions
+
+`www.nseindia.com` (live quotes, option chains, charting) enforces strict firewall rules:
+
+- **Geo-blocking** — requests from IPs outside India are frequently rejected with 403 or TCP resets
+- **Cloud IP blocking** — AWS, GCP, Azure, DigitalOcean and similar data-centre ranges are blocked even within India
+
+**Run from a residential Indian internet connection.** Residential proxies are an alternative.
+
+The archive domain `nsearchives.nseindia.com` (bhavcopy downloads) does **not** have these restrictions and works globally.
+
+---
+
+## Running the Example
+
 ```bash
 cargo run --example demo
 ```
 
 ---
-Credits:
-This library is inspired by Python's popular `jugaad-data` and `nsemine` libraries, rewritten from the ground up in pure Rust for type safety, zero-cost abstractions, multi-threaded safety, and low resource overhead.
 
-## 📄 License
+Credits: inspired by Python's `jugaad-data` and `nsemine` — rewritten in Rust for type safety, zero-cost abstractions, and no runtime overhead.
 
-This library is licensed under the MIT License.
+## License
+
+MIT
