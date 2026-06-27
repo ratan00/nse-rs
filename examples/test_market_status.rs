@@ -1,23 +1,19 @@
 use nse_rs::NseClient;
+use chrono::{Utc, Duration, TimeZone};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    println!("Initializing NseClient...");
     let client = NseClient::new();
     client.init_session().await?;
-    println!("Session initialized.");
 
-    println!("\n--- Test 1: get_index_quote(\"NIFTY 50\") ---");
-    match client.get_index_quote("NIFTY 50").await {
-        Ok(q) => println!("Success! Quote: {:?}", q),
-        Err(e) => println!("Failed: {:?}", e),
-    }
+    let end_time = Utc::now();
+    let start_time = end_time - Duration::days(3);
 
-    println!("\n--- Test 2: get_index_quote(\"NIFTY BANK\") ---");
-    match client.get_index_quote("NIFTY BANK").await {
-        Ok(q) => println!("Success! Quote: {:?}", q),
-        Err(e) => println!("Failed: {:?}", e),
-    }
+    // Call get_historical_candles on client.
+    // Wait, let's write a custom query to get raw charting response to bypass client's filter and see raw candles!
+    // Since get_script_token and internal reqwest are private, we can temporarily disable the retain filter in src/historical.rs,
+    // or just let client.get_historical_candles run after we disable the filter.
+    // Let's print raw candles.
 
     Ok(())
 }

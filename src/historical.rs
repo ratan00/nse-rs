@@ -127,19 +127,44 @@ pub async fn get_historical_candles(
     let mut candles = resp.data.unwrap_or_default();
 
     if is_intraday {
-        let ist_tz = FixedOffset::east_opt(IST_OFFSET_SECS).expect("valid IST offset");
         let market_open  = NaiveTime::from_hms_opt(9, 15, 0).expect("valid time");
         let market_close = NaiveTime::from_hms_opt(15, 30, 0).expect("valid time");
 
         candles.retain(|c| {
-            Utc.timestamp_opt(c.time / 1000, ((c.time % 1000) * 1_000_000) as u32)
+            Utc.timestamp_opt(c.time / 1000, 0)
                 .single()
                 .map(|dt| {
-                    let t = dt.with_timezone(&ist_tz).time();
+                    let t = dt.time();
                     t >= market_open && t < market_close
                 })
                 .unwrap_or(false)
         });
+
+        // Convert cumulative day volume to discrete per-bar volume
+        if !candles.is_empty() {
+            let mut prev_vol = candles[0].volume;
+            let ist_tz = FixedOffset::east_opt(IST_OFFSET_SECS).expect("valid IST offset");
+            for i in 1..candles.len() {
+                let cur_vol = candles[i].volume;
+
+                let prev_dt = Utc.timestamp_opt(candles[i - 1].time / 1000, 0)
+                    .single()
+                    .map(|dt| dt.with_timezone(&ist_tz).date_naive());
+                let cur_dt = Utc.timestamp_opt(candles[i].time / 1000, 0)
+                    .single()
+                    .map(|dt| dt.with_timezone(&ist_tz).date_naive());
+
+                let same_day = prev_dt.zip(cur_dt).map(|(a, b)| a == b).unwrap_or(false);
+
+                if same_day {
+                    let diff = cur_vol - prev_vol;
+                    candles[i].volume = if diff >= 0.0 { diff } else { cur_vol };
+                } else {
+                    candles[i].volume = cur_vol;
+                }
+                prev_vol = cur_vol;
+            }
+        }
     }
 
     Ok(candles)
