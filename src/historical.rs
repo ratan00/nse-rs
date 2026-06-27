@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use reqwest::header::COOKIE;
 use serde::Deserialize;
@@ -6,8 +7,11 @@ use chrono::{DateTime, Utc, TimeZone, FixedOffset, NaiveTime};
 use crate::models::{ChartResponse, ChartCandle};
 use crate::session::format_cookie_header;
 
-const SEARCH_TOKEN_URL: &str = "https://charting.nseindia.com/v1/exchanges/symbolsDynamic";
+const SEARCH_TOKEN_URL: &str   = "https://charting.nseindia.com/v1/exchanges/symbolsDynamic";
 const HISTORICAL_DATA_URL: &str = "https://charting.nseindia.com/v1/charts/symbolHistoricalData";
+
+/// IST = UTC+5:30 = 19800 seconds east
+const IST_OFFSET_SECS: i32 = 5 * 3600 + 30 * 60;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SymbolSearchResponse {
@@ -16,64 +20,64 @@ pub struct SymbolSearchResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SymbolSearchItem {
-    pub symbol: String,
+    pub symbol:    String,
     pub scripcode: String,
     #[serde(rename = "type")]
     pub instrument_type: String,
     pub description: String,
 }
 
-/// Fetch script token, symbol name, and segment type from symbolsDynamic endpoint
+/// Look up the charting token for `symbol`.
+/// Returns `(charting_symbol, scripcode, instrument_type)`.
 pub async fn get_script_token(
     client: &Client,
     cookies: &HashMap<String, String>,
     symbol: &str,
-) -> Result<(String, String, String), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(String, String, String)> {
     let cookie_val = format_cookie_header(cookies);
-    
-    let resp = client.get(SEARCH_TOKEN_URL)
+    let resp: SymbolSearchResponse = client
+        .get(SEARCH_TOKEN_URL)
         .header(COOKIE, cookie_val)
         .query(&[("segment", ""), ("symbol", symbol)])
         .send()
-        .await?
-        .json::<SymbolSearchResponse>()
-        .await?;
+        .await
+        .context("symbol search request")?
+        .json()
+        .await
+        .context("symbol search decode")?;
 
-    let search_symbol = symbol.to_uppercase();
-    
-    // 1. Exact match (split by '-')
-    if let Some(item) = resp.data.iter().find(|i| {
-        let sym_base = i.symbol.split('-').next().unwrap_or("").to_uppercase();
-        sym_base == search_symbol
+    let search = symbol.to_uppercase();
+    let items = &resp.data;
+
+    // 1. Exact match on the base part before '-'
+    if let Some(item) = items.iter().find(|i| {
+        i.symbol.split('-').next().unwrap_or("").to_uppercase() == search
     }) {
         return Ok((item.symbol.clone(), item.scripcode.clone(), item.instrument_type.clone()));
     }
-    
-    // 2. Starts with match
-    if let Some(item) = resp.data.iter().find(|i| {
-        let sym_base = i.symbol.split('-').next().unwrap_or("").to_uppercase();
-        sym_base.starts_with(&search_symbol)
+    // 2. Starts-with
+    if let Some(item) = items.iter().find(|i| {
+        i.symbol.split('-').next().unwrap_or("").to_uppercase().starts_with(&search)
     }) {
         return Ok((item.symbol.clone(), item.scripcode.clone(), item.instrument_type.clone()));
     }
-    
-    // 3. Description contains match
-    if let Some(item) = resp.data.iter().find(|i| {
-        i.description.to_uppercase().contains(&search_symbol)
+    // 3. Description contains
+    if let Some(item) = items.iter().find(|i| {
+        i.description.to_uppercase().contains(&search)
     }) {
         return Ok((item.symbol.clone(), item.scripcode.clone(), item.instrument_type.clone()));
     }
-    
-    // Fallback: pick first
-    if let Some(item) = resp.data.first() {
+    // 4. First result as fallback
+    if let Some(item) = items.first() {
         return Ok((item.symbol.clone(), item.scripcode.clone(), item.instrument_type.clone()));
     }
-    
-    Err("Symbol not found".into())
+
+    bail!("symbol '{symbol}' not found in NSE charting search")
 }
 
-/// Fetches historical data for a symbol resolved via token dynamic search.
-/// `interval` can be minutes (e.g. "1", "3", "5", "15", "30", "60") or "D", "W", "M"
+/// Fetch historical candles.
+/// `interval` is `"1"`, `"3"`, `"5"`, `"15"`, `"30"`, `"60"` (minutes) or `"D"`, `"W"`, `"M"`.
+/// Intraday candles are filtered to market hours (09:15–15:30 IST).
 pub async fn get_historical_candles(
     client: &Client,
     cookies: &HashMap<String, String>,
@@ -81,67 +85,60 @@ pub async fn get_historical_candles(
     start_time: DateTime<Utc>,
     end_time: DateTime<Utc>,
     interval: &str,
-) -> Result<Vec<ChartCandle>, Box<dyn std::error::Error + Send + Sync>> {
-    let (real_symbol, token, symbol_type) = get_script_token(client, cookies, symbol).await?;
-    
-    let is_intraday = match interval {
-        "D" | "W" | "M" => false,
-        _ => true,
-    };
-    
-    // Handle NSE IST time offset calculation
+) -> Result<Vec<ChartCandle>> {
+    let (real_symbol, token, symbol_type) =
+        get_script_token(client, cookies, symbol).await?;
+
+    let is_intraday = !matches!(interval, "D" | "W" | "M");
+
+    // NSE's charting API expects IST Unix timestamps for intraday, UTC for EOD.
     let (chart_type, time_interval, start_ts, end_ts) = if is_intraday {
-        let ist_offset = 19800; // 5 hours 30 mins
-        let int_val = interval.parse::<i32>().unwrap_or(3);
+        let int_val: i32 = interval.parse().unwrap_or(3);
         (
             "I".to_string(),
             int_val,
-            start_time.timestamp() + ist_offset,
-            end_time.timestamp() + ist_offset,
+            start_time.timestamp() + IST_OFFSET_SECS as i64,
+            end_time.timestamp()   + IST_OFFSET_SECS as i64,
         )
     } else {
-        (
-            interval.to_string(),
-            1,
-            start_time.timestamp(),
-            end_time.timestamp(),
-        )
+        (interval.to_string(), 1, start_time.timestamp(), end_time.timestamp())
     };
 
     let cookie_val = format_cookie_header(cookies);
-    let resp = client.get(HISTORICAL_DATA_URL)
+    let resp: ChartResponse = client
+        .get(HISTORICAL_DATA_URL)
         .header(COOKIE, cookie_val)
         .query(&[
-            ("chartType", &chart_type),
-            ("fromDate", &start_ts.to_string()),
-            ("symbol", &real_symbol),
-            ("symbolType", &symbol_type),
+            ("chartType",    &chart_type),
+            ("fromDate",     &start_ts.to_string()),
+            ("symbol",       &real_symbol),
+            ("symbolType",   &symbol_type),
             ("timeInterval", &time_interval.to_string()),
-            ("toDate", &end_ts.to_string()),
-            ("token", &token),
+            ("toDate",       &end_ts.to_string()),
+            ("token",        &token),
         ])
         .send()
-        .await?
-        .json::<ChartResponse>()
-        .await?;
+        .await
+        .context("historical data request")?
+        .json()
+        .await
+        .context("historical data decode")?;
 
     let mut candles = resp.data.unwrap_or_default();
-    
-    // Filter out pre-market and post-market price levels for intraday data
+
     if is_intraday {
-        let ist_tz = FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap();
-        let start_market = NaiveTime::from_hms_opt(9, 15, 0).unwrap();
-        let end_market = NaiveTime::from_hms_opt(15, 30, 0).unwrap();
-        
-        candles.retain(|candle| {
-            // Convert millisecond timestamp to IST
-            if let Some(dt_utc) = Utc.timestamp_opt(candle.time / 1000, ((candle.time % 1000) * 1_000_000) as u32).single() {
-                let dt_ist = dt_utc.with_timezone(&ist_tz);
-                let time = dt_ist.time();
-                time >= start_market && time < end_market
-            } else {
-                false
-            }
+        let ist_tz = FixedOffset::east_opt(IST_OFFSET_SECS).expect("valid IST offset");
+        let market_open  = NaiveTime::from_hms_opt(9, 15, 0).expect("valid time");
+        let market_close = NaiveTime::from_hms_opt(15, 30, 0).expect("valid time");
+
+        candles.retain(|c| {
+            Utc.timestamp_opt(c.time / 1000, ((c.time % 1000) * 1_000_000) as u32)
+                .single()
+                .map(|dt| {
+                    let t = dt.with_timezone(&ist_tz).time();
+                    t >= market_open && t < market_close
+                })
+                .unwrap_or(false)
         });
     }
 

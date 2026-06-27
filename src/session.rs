@@ -6,7 +6,7 @@ use reqwest::header::{HeaderValue, SET_COOKIE};
 use reqwest::Client;
 use crate::models::SessionCache;
 
-const FIRST_BOY: &str = "https://www.nseindia.com/get-quote/equity/RELIANCE/Reliance-Industries-Limited";
+const SESSION_WARMUP_URL: &str = "https://www.nseindia.com/get-quote/equity/RELIANCE/Reliance-Industries-Limited";
 
 /// Get cache file path in standard local cache directory
 pub fn get_cache_path() -> Option<PathBuf> {
@@ -82,7 +82,7 @@ pub fn format_cookie_header(cookies: &HashMap<String, String>) -> HeaderValue {
 
 /// Helper to request cookies from the landing page
 pub async fn fetch_new_cookies(client: &Client) -> Result<HashMap<String, String>, reqwest::Error> {
-    let resp = client.get(FIRST_BOY).send().await?;
+    let resp = client.get(SESSION_WARMUP_URL).send().await?;
     let cookies = extract_cookies(&resp);
     Ok(cookies)
 }

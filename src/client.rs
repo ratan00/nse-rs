@@ -1,199 +1,274 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
-use chrono::{DateTime, Utc, NaiveDate};
+use anyhow::{Context, Result};
+use chrono::NaiveDate;
 use reqwest::Client;
 use reqwest::header::{HeaderMap, HeaderValue};
-use crate::models::{NextApiQuoteResponse, NextApiDerivativesResponse, DerivativeContract, ChartCandle, HistoricalRecord};
+use tokio::sync::mpsc;
+use tokio::time::{interval, Duration};
+use crate::models::{
+    ChartCandle, DerivativeContract, FoBhavRecord, HistoricalRecord,
+    NextApiDerivativesResponse, NextApiQuoteResponse, NseIndexQuote, NseQuote,
+    OptionChain,
+};
 use crate::session::{load_session_cache, save_session_cache, fetch_new_cookies};
-use crate::live;
-use crate::historical;
-use crate::archives;
+use crate::{live, historical, archives};
+
+/// Cached charting token for a symbol: `(charting_symbol, scripcode, instrument_type)`.
+type TokenEntry = (String, String, String);
 
 pub struct NseClient {
-    client: Client,
-    cookies: RwLock<HashMap<String, String>>,
+    client:      Client,
+    cookies:     RwLock<HashMap<String, String>>,
+    /// In-memory cache: NSE symbol (uppercase) → charting token triple.
+    token_cache: RwLock<HashMap<String, TokenEntry>>,
 }
 
 impl NseClient {
-    /// Create a new NseClient instance with configured request headers
     pub fn new() -> Self {
         let mut headers = HeaderMap::new();
-        headers.insert("User-Agent", HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"));
-        headers.insert("Accept", HeaderValue::from_static("application/json, text/javascript, */*; q=0.01"));
-        headers.insert("Accept-Language", HeaderValue::from_static("en-US,en;q=0.9"));
-        headers.insert("Connection", HeaderValue::from_static("keep-alive"));
-        headers.insert("Referer", HeaderValue::from_static("https://www.nseindia.com/"));
+        headers.insert("User-Agent",       HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"));
+        headers.insert("Accept",           HeaderValue::from_static("application/json, text/javascript, */*; q=0.01"));
+        headers.insert("Accept-Language",  HeaderValue::from_static("en-US,en;q=0.9"));
+        headers.insert("Connection",       HeaderValue::from_static("keep-alive"));
+        headers.insert("Referer",          HeaderValue::from_static("https://www.nseindia.com/"));
         headers.insert("X-Requested-With", HeaderValue::from_static("XMLHttpRequest"));
 
         let client = Client::builder()
             .default_headers(headers)
-            .timeout(std::time::Duration::from_secs(15))
+            .timeout(Duration::from_secs(15))
             .build()
-            .unwrap_or_else(|_| Client::new());
+            .unwrap_or_default();
 
         Self {
             client,
-            cookies: RwLock::new(HashMap::new()),
+            cookies:     RwLock::new(HashMap::new()),
+            token_cache: RwLock::new(HashMap::new()),
         }
     }
 
-    /// Load the session from cache or request a new one
-    pub async fn init_session(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // 1. Try to load cached session
+    // ── Session ───────────────────────────────────────────────────────────────
+
+    /// Load the session from disk cache or request a fresh one.
+    pub async fn init_session(&self) -> Result<()> {
         if let Some(cache) = load_session_cache() {
-            let mut cookies_lock = self.cookies.write().map_err(|e| format!("Lock error: {}", e))?;
-            *cookies_lock = cache.cookies;
+            *self.cookies.write().unwrap() = cache.cookies;
             return Ok(());
         }
+        self.force_refresh_session().await
+    }
 
-        // 2. Fetch new cookies if cache is missing/expired
-        let fresh_cookies = fetch_new_cookies(&self.client).await?;
-        
-        // 3. Save to disk cache
-        save_session_cache(&fresh_cookies);
-        
-        // 4. Store in memory
-        let mut cookies_lock = self.cookies.write().map_err(|e| format!("Lock error: {}", e))?;
-        *cookies_lock = fresh_cookies;
-        
+    /// Discard cached cookies and fetch a new session.
+    pub async fn force_refresh_session(&self) -> Result<()> {
+        let fresh = fetch_new_cookies(&self.client)
+            .await
+            .context("fetch session cookies")?;
+        save_session_cache(&fresh);
+        *self.cookies.write().unwrap() = fresh;
         Ok(())
     }
 
-    /// Refresh the session forcefully, ignoring cached values
-    pub async fn force_refresh_session(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let fresh_cookies = fetch_new_cookies(&self.client).await?;
-        save_session_cache(&fresh_cookies);
-        
-        let mut cookies_lock = self.cookies.write().map_err(|e| format!("Lock error: {}", e))?;
-        *cookies_lock = fresh_cookies;
-        Ok(())
+    fn cookies(&self) -> HashMap<String, String> {
+        self.cookies.read().unwrap().clone()
     }
 
-    /// Get live stock quote
-    pub async fn get_stock_quote(&self, symbol: &str) -> Result<NextApiQuoteResponse, Box<dyn std::error::Error + Send + Sync>> {
-        let cookies = self.cookies.read().map_err(|e| format!("Lock error: {}", e))?.clone();
-        
-        // Attempt request; if it fails with empty response/forbidden, refresh cookie once
-        match live::get_stock_quote(&self.client, &cookies, symbol).await {
-            Ok(res) => Ok(res),
-            Err(e) => {
-                // If it looks like a blocked session, retry after cookie refresh
-                if e.is_status() || e.is_decode() {
-                    self.force_refresh_session().await?;
-                    let fresh_cookies = self.cookies.read().map_err(|e| format!("Lock error: {}", e))?.clone();
-                    let retry_res = live::get_stock_quote(&self.client, &fresh_cookies, symbol).await?;
-                    Ok(retry_res)
-                } else {
-                    Err(Box::new(e))
-                }
+    /// Run `f(cookies)` and on session-related failure refresh once and retry.
+    async fn with_session_retry<F, Fut, T>(&self, f: F) -> Result<T>
+    where
+        F: Fn(HashMap<String, String>) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        match f(self.cookies()).await {
+            Ok(v) => Ok(v),
+            Err(_) => {
+                self.force_refresh_session().await?;
+                f(self.cookies()).await
             }
         }
     }
 
-    /// Get derivative options and futures quote
-    pub async fn get_derivatives_quote(&self, symbol: &str) -> Result<NextApiDerivativesResponse, Box<dyn std::error::Error + Send + Sync>> {
-        let cookies = self.cookies.read().map_err(|e| format!("Lock error: {}", e))?.clone();
-        
-        match live::get_derivatives_quote(&self.client, &cookies, symbol).await {
-            Ok(res) => Ok(res),
-            Err(e) => {
-                if e.is_status() || e.is_decode() {
-                    self.force_refresh_session().await?;
-                    let fresh_cookies = self.cookies.read().map_err(|e| format!("Lock error: {}", e))?.clone();
-                    let retry_res = live::get_derivatives_quote(&self.client, &fresh_cookies, symbol).await?;
-                    Ok(retry_res)
-                } else {
-                    Err(Box::new(e))
-                }
-            }
-        }
+    // ── Live equity ───────────────────────────────────────────────────────────
+
+    /// Raw NextApi response for an equity symbol.
+    pub async fn get_stock_quote_raw(&self, symbol: &str) -> Result<NextApiQuoteResponse> {
+        let sym = symbol.to_string();
+        self.with_session_retry(|c| {
+            let sym = sym.clone();
+            let client = self.client.clone();
+            async move { live::get_stock_quote(&client, &c, &sym).await }
+        })
+        .await
     }
 
-    /// Get only futures contracts for a symbol (filtered from the derivatives list)
-    pub async fn get_futures(&self, symbol: &str) -> Result<Vec<DerivativeContract>, Box<dyn std::error::Error + Send + Sync>> {
-        let deriv = self.get_derivatives_quote(symbol).await?;
-        let futures = deriv.data.unwrap_or_default()
+    /// Flat `NseQuote` for an equity symbol.
+    pub async fn get_stock_quote(&self, symbol: &str) -> Result<NseQuote> {
+        self.get_stock_quote_raw(symbol)
+            .await?
+            .into_quote()
+            .with_context(|| format!("no quote data for '{symbol}'"))
+    }
+
+    // ── Live index ────────────────────────────────────────────────────────────
+
+    /// Quote for an NSE index (e.g. `"NIFTY 50"`, `"NIFTY BANK"`).
+    pub async fn get_index_quote(&self, index_name: &str) -> Result<NseIndexQuote> {
+        let name = index_name.to_string();
+        self.with_session_retry(|c| {
+            let name = name.clone();
+            let client = self.client.clone();
+            async move { live::get_index_quote(&client, &c, &name).await }
+        })
+        .await
+    }
+
+    // ── Derivatives ───────────────────────────────────────────────────────────
+
+    pub async fn get_derivatives_quote(&self, symbol: &str) -> Result<NextApiDerivativesResponse> {
+        let sym = symbol.to_string();
+        self.with_session_retry(|c| {
+            let sym = sym.clone();
+            let client = self.client.clone();
+            async move { live::get_derivatives_quote(&client, &c, &sym).await }
+        })
+        .await
+    }
+
+    pub async fn get_futures(&self, symbol: &str) -> Result<Vec<DerivativeContract>> {
+        Ok(self
+            .get_derivatives_quote(symbol)
+            .await?
+            .data
+            .unwrap_or_default()
             .into_iter()
             .filter(|c| c.instrument_type.starts_with("FUT"))
-            .collect();
-        Ok(futures)
+            .collect())
     }
 
-    /// Get only option chain contracts for a symbol (filtered from the derivatives list)
-    pub async fn get_option_chain(&self, symbol: &str) -> Result<Vec<DerivativeContract>, Box<dyn std::error::Error + Send + Sync>> {
-        let deriv = self.get_derivatives_quote(symbol).await?;
-        let options = deriv.data.unwrap_or_default()
+    pub async fn get_option_contracts(&self, symbol: &str) -> Result<Vec<DerivativeContract>> {
+        Ok(self
+            .get_derivatives_quote(symbol)
+            .await?
+            .data
+            .unwrap_or_default()
             .into_iter()
             .filter(|c| c.instrument_type.starts_with("OPT"))
-            .collect();
-        Ok(options)
+            .collect())
     }
 
-    /// Get historical charting candles (intraday minutes or daily/weekly/monthly)
+    /// Full option chain grouped by expiry date and strike.
+    pub async fn get_option_chain(&self, symbol: &str) -> Result<OptionChain> {
+        let contracts = self
+            .get_derivatives_quote(symbol)
+            .await?
+            .data
+            .unwrap_or_default();
+        Ok(OptionChain::from_contracts(symbol, contracts))
+    }
+
+    // ── Historical candles ────────────────────────────────────────────────────
+
+    /// Historical OHLCV candles.  Token lookups are cached in memory.
     pub async fn get_historical_candles(
         &self,
         symbol: &str,
-        start_time: DateTime<Utc>,
-        end_time: DateTime<Utc>,
+        start_time: chrono::DateTime<chrono::Utc>,
+        end_time: chrono::DateTime<chrono::Utc>,
         interval: &str,
-    ) -> Result<Vec<ChartCandle>, Box<dyn std::error::Error + Send + Sync>> {
-        let cookies = self.cookies.read().map_err(|e| format!("Lock error: {}", e))?.clone();
-        
-        match historical::get_historical_candles(&self.client, &cookies, symbol, start_time, end_time, interval).await {
-            Ok(res) => Ok(res),
-            Err(_) => {
-                // Refresh session on any session-related charting failure
-                self.force_refresh_session().await?;
-                let fresh_cookies = self.cookies.read().map_err(|e| format!("Lock error: {}", e))?.clone();
-                let retry_res = historical::get_historical_candles(&self.client, &fresh_cookies, symbol, start_time, end_time, interval).await?;
-                Ok(retry_res)
+    ) -> Result<Vec<ChartCandle>> {
+        let sym = symbol.to_string();
+        let int = interval.to_string();
+        // Check token cache first to skip the extra search request.
+        let cached = self.token_cache.read().unwrap().get(&sym.to_uppercase()).cloned();
+        if cached.is_none() {
+            // Warm the token cache.
+            let cookies = self.cookies();
+            if let Ok(entry) = historical::get_script_token(&self.client, &cookies, &sym).await {
+                self.token_cache.write().unwrap().insert(sym.to_uppercase(), entry);
+            }
+        }
+        self.with_session_retry(|c| {
+            let sym = sym.clone();
+            let int = int.clone();
+            let client = self.client.clone();
+            async move {
+                historical::get_historical_candles(&client, &c, &sym, start_time, end_time, &int).await
+            }
+        })
+        .await
+    }
+
+    // ── Polling live feed ─────────────────────────────────────────────────────
+
+    /// Poll `symbol` at `interval_ms` milliseconds and send each `NseQuote` to `tx`.
+    /// Stops when `tx` is closed or the task is cancelled.
+    /// Automatically refreshes the session on auth failures.
+    pub async fn poll_quote(
+        &self,
+        symbol: &str,
+        interval_ms: u64,
+        tx: mpsc::Sender<NseQuote>,
+    ) {
+        let mut ticker = interval(Duration::from_millis(interval_ms));
+        loop {
+            ticker.tick().await;
+            if tx.is_closed() { break; }
+            match self.get_stock_quote(symbol).await {
+                Ok(q)  => { if tx.send(q).await.is_err() { break; } }
+                Err(e) => { eprintln!("poll_quote error for {symbol}: {e:#}"); }
             }
         }
     }
 
-    /// Download and parse full bhavcopy CSV containing delivery details
-    pub async fn fetch_full_bhavcopy(&self, date: NaiveDate) -> Result<Vec<HistoricalRecord>, Box<dyn std::error::Error + Send + Sync>> {
+    /// Poll an index at `interval_ms` milliseconds.
+    pub async fn poll_index(
+        &self,
+        index_name: &str,
+        interval_ms: u64,
+        tx: mpsc::Sender<NseIndexQuote>,
+    ) {
+        let mut ticker = interval(Duration::from_millis(interval_ms));
+        loop {
+            ticker.tick().await;
+            if tx.is_closed() { break; }
+            match self.get_index_quote(index_name).await {
+                Ok(q)  => { if tx.send(q).await.is_err() { break; } }
+                Err(e) => { eprintln!("poll_index error for {index_name}: {e:#}"); }
+            }
+        }
+    }
+
+    // ── Market status ─────────────────────────────────────────────────────────
+
+    pub async fn get_market_status(&self) -> Result<crate::models::MarketStatusResponse> {
+        self.with_session_retry(|c| {
+            let client = self.client.clone();
+            async move {
+                live::get_market_status(&client, &c)
+                    .await
+            }
+        })
+        .await
+    }
+
+    // ── Archives ─────────────────────────────────────────────────────────────
+
+    pub async fn fetch_full_bhavcopy(&self, date: NaiveDate) -> Result<Vec<HistoricalRecord>> {
         archives::fetch_full_bhavcopy(&self.client, date).await
     }
 
-    /// Download and parse standard zipped bhavcopy (useful for older historical files)
-    pub async fn fetch_zipped_bhavcopy(&self, date: NaiveDate) -> Result<Vec<HistoricalRecord>, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn fetch_zipped_bhavcopy(&self, date: NaiveDate) -> Result<Vec<HistoricalRecord>> {
         archives::fetch_zipped_bhavcopy(&self.client, date).await
     }
 
-    /// Fetch a master list of all actively trading symbols for a given date
-    pub async fn fetch_symbol_list(&self, date: NaiveDate) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-        archives::fetch_symbol_list(&self.client, date).await
-    }
-
-    /// Check current market status (Open, Closed, Pre-market)
-    pub async fn get_market_status(&self) -> Result<crate::models::MarketStatusResponse, Box<dyn std::error::Error + Send + Sync>> {
-        let cookies = self.cookies.read().map_err(|e| format!("Lock error: {}", e))?.clone();
-        
-        match live::get_market_status(&self.client, &cookies).await {
-            Ok(res) => Ok(res),
-            Err(e) => {
-                if e.is_status() || e.is_decode() {
-                    self.force_refresh_session().await?;
-                    let fresh_cookies = self.cookies.read().map_err(|e| format!("Lock error: {}", e))?.clone();
-                    let retry_res = live::get_market_status(&self.client, &fresh_cookies).await?;
-                    Ok(retry_res)
-                } else {
-                    Err(Box::new(e))
-                }
-            }
-        }
-    }
-
-    /// Download Historical Option Chain Data (EOD F&O Bhavcopy)
-    /// Returns the raw CSV text since the file formats vary between dates.
-    pub async fn fetch_fo_bhavcopy(&self, date: NaiveDate) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn fetch_fo_bhavcopy(&self, date: NaiveDate) -> Result<Vec<FoBhavRecord>> {
         archives::fetch_fo_bhavcopy(&self.client, date).await
+    }
+
+    pub async fn fetch_symbol_list(&self, date: NaiveDate) -> Result<Vec<String>> {
+        archives::fetch_symbol_list(&self.client, date).await
     }
 }
 
 impl Default for NseClient {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }

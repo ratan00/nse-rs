@@ -1,211 +1,240 @@
 use std::io::Read;
+use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use chrono::NaiveDate;
-use crate::models::HistoricalRecord;
+use crate::models::{HistoricalRecord, FoBhavRecord};
 
 const BASE_ARCHIVES_URL: &str = "https://nsearchives.nseindia.com";
 
-/// Fetch full bhavcopy CSV containing delivery data
-/// URL: https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_DDMMYYYY.csv
+/// Fetch full bhavcopy CSV (includes delivery data).
 pub async fn fetch_full_bhavcopy(
     client: &Client,
     date: NaiveDate,
-) -> Result<Vec<HistoricalRecord>, Box<dyn std::error::Error + Send + Sync>> {
-    let date_str = date.format("%d%m%Y").to_string();
-    let url = format!("{}/products/content/sec_bhavdata_full_{}.csv", BASE_ARCHIVES_URL, date_str);
-    
-    let resp = client.get(&url)
-        .header(reqwest::header::ACCEPT, "*/*")
-        .send().await?;
-    if !resp.status().is_success() {
-        return Err(format!("Failed to download full bhavcopy, status: {}", resp.status()).into());
-    }
-    
-    let csv_text = resp.text().await?;
-    let records = parse_full_bhavcopy(&csv_text)?;
-    Ok(records)
+) -> Result<Vec<HistoricalRecord>> {
+    let url = format!(
+        "{}/products/content/sec_bhavdata_full_{}.csv",
+        BASE_ARCHIVES_URL,
+        date.format("%d%m%Y"),
+    );
+    let text = get_text(client, &url).await?;
+    parse_full_bhavcopy(&text)
 }
 
-/// Fetch a master list of all actively trading symbols for a given date
-pub async fn fetch_symbol_list(
-    client: &Client,
-    date: NaiveDate,
-) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+/// Fetch a list of all actively trading equity symbols for a given date.
+pub async fn fetch_symbol_list(client: &Client, date: NaiveDate) -> Result<Vec<String>> {
     let records = match fetch_full_bhavcopy(client, date).await {
-        Ok(r) => r,
+        Ok(r)  => r,
         Err(_) => fetch_zipped_bhavcopy(client, date).await?,
     };
-    
     let mut symbols: Vec<String> = records
         .into_iter()
-        .filter(|r| r.series == "EQ" || r.series == "BE" || r.series == "SM" || r.series == "MF")
+        .filter(|r| matches!(r.series.as_str(), "EQ" | "BE" | "SM" | "MF"))
         .map(|r| r.symbol)
         .collect();
-        
     symbols.sort();
     symbols.dedup();
-    
     Ok(symbols)
 }
 
-/// Fetch standard zipped bhavcopy (no delivery data, but covers older historical dates)
-/// URL: https://nsearchives.nseindia.com/content/historical/EQUITIES/YYYY/MMM/cmDDMMM[YYYY]bhav.csv.zip
+/// Fetch standard zipped bhavcopy (older format, no delivery data).
 pub async fn fetch_zipped_bhavcopy(
     client: &Client,
     date: NaiveDate,
-) -> Result<Vec<HistoricalRecord>, Box<dyn std::error::Error + Send + Sync>> {
-    let yyyy = date.format("%Y").to_string();
-    let mmm = date.format("%b").to_string().to_uppercase();
-    let date_upper = date.format("%d%b%Y").to_string().to_uppercase();
-    
+) -> Result<Vec<HistoricalRecord>> {
+    let yyyy     = date.format("%Y").to_string();
+    let mmm      = date.format("%b").to_string().to_uppercase();
+    let date_up  = date.format("%d%b%Y").to_string().to_uppercase();
     let url = format!(
         "{}/content/historical/EQUITIES/{}/{}/cm{}bhav.csv.zip",
-        BASE_ARCHIVES_URL, yyyy, mmm, date_upper
+        BASE_ARCHIVES_URL, yyyy, mmm, date_up,
     );
-    
-    let resp = client.get(&url)
-        .header(reqwest::header::ACCEPT, "*/*")
-        .send().await?;
-    if !resp.status().is_success() {
-        return Err(format!("Failed to download zipped bhavcopy, status: {}", resp.status()).into());
-    }
-    
-    let bytes = resp.bytes().await?;
-    let cursor = std::io::Cursor::new(bytes);
-    let mut archive = zip::ZipArchive::new(cursor)?;
-    
-    // Find the first CSV file in the zip
-    let mut file = archive.by_index(0)?;
-    let mut csv_text = String::new();
-    file.read_to_string(&mut csv_text)?;
-    
-    let records = parse_zipped_bhavcopy(&csv_text, date)?;
-    Ok(records)
+    let text = get_zip_text(client, &url).await?;
+    parse_zipped_bhavcopy(&text, date)
 }
 
-/// Fetch F&O Bhavcopy (Option chain & futures EOD data)
-/// Handles both the pre-July 2024 legacy ZIP and the post-July 2024 UDiFF ZIP formats.
-/// Returns the raw CSV text as the column structures differ wildly between the two formats.
-pub async fn fetch_fo_bhavcopy(
-    client: &Client,
-    date: NaiveDate,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let transition_date = NaiveDate::from_ymd_opt(2024, 7, 8).unwrap();
-    
-    let url = if date >= transition_date {
-        let date_str = date.format("%Y%m%d").to_string();
-        format!("{}/content/fo/BhavCopy_NSE_FO_0_0_0_{}_F_0000.csv.zip", BASE_ARCHIVES_URL, date_str)
+/// Fetch and parse F&O bhavcopy into typed `FoBhavRecord`s.
+/// Handles both the pre-July-2024 legacy and the post-July-2024 UDiFF ZIP formats.
+pub async fn fetch_fo_bhavcopy(client: &Client, date: NaiveDate) -> Result<Vec<FoBhavRecord>> {
+    let transition = NaiveDate::from_ymd_opt(2024, 7, 8).expect("valid date");
+    let url = if date >= transition {
+        format!(
+            "{}/content/fo/BhavCopy_NSE_FO_0_0_0_{}_F_0000.csv.zip",
+            BASE_ARCHIVES_URL,
+            date.format("%Y%m%d"),
+        )
     } else {
-        let yyyy = date.format("%Y").to_string();
-        let mmm = date.format("%b").to_string().to_uppercase();
-        let date_upper = date.format("%d%b%Y").to_string().to_uppercase();
-        format!("{}/content/historical/DERIVATIVES/{}/{}/fo{}bhav.csv.zip", BASE_ARCHIVES_URL, yyyy, mmm, date_upper)
+        let yyyy    = date.format("%Y").to_string();
+        let mmm     = date.format("%b").to_string().to_uppercase();
+        let date_up = date.format("%d%b%Y").to_string().to_uppercase();
+        format!(
+            "{}/content/historical/DERIVATIVES/{}/{}/fo{}bhav.csv.zip",
+            BASE_ARCHIVES_URL, yyyy, mmm, date_up,
+        )
     };
-    
-    let resp = client.get(&url)
+
+    let text = get_zip_text(client, &url).await?;
+    let transition = NaiveDate::from_ymd_opt(2024, 7, 8).expect("valid date");
+    if date >= transition {
+        parse_fo_udiff(&text)
+    } else {
+        parse_fo_legacy(&text)
+    }
+}
+
+// ── HTTP helpers ──────────────────────────────────────────────────────────────
+
+async fn get_text(client: &Client, url: &str) -> Result<String> {
+    let resp = client
+        .get(url)
         .header(reqwest::header::ACCEPT, "*/*")
-        .send().await?;
-        
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
     if !resp.status().is_success() {
-        return Err(format!("Failed to download F&O bhavcopy, status: {}", resp.status()).into());
+        bail!("HTTP {} for {url}", resp.status());
     }
-    
-    let bytes = resp.bytes().await?;
+    resp.text().await.context("read response text")
+}
+
+async fn get_zip_text(client: &Client, url: &str) -> Result<String> {
+    let resp = client
+        .get(url)
+        .header(reqwest::header::ACCEPT, "*/*")
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    if !resp.status().is_success() {
+        bail!("HTTP {} for {url}", resp.status());
+    }
+    let bytes  = resp.bytes().await.context("read bytes")?;
     let cursor = std::io::Cursor::new(bytes);
-    let mut archive = zip::ZipArchive::new(cursor)?;
-    
-    let mut file = archive.by_index(0)?;
-    let mut csv_text = String::new();
-    file.read_to_string(&mut csv_text)?;
-    
-    Ok(csv_text)
+    let mut archive = zip::ZipArchive::new(cursor).context("open zip")?;
+    let mut file = archive.by_index(0).context("zip first entry")?;
+    let mut text = String::new();
+    file.read_to_string(&mut text).context("read zip entry")?;
+    Ok(text)
 }
 
-/// Parse full bhavcopy CSV text
-fn parse_full_bhavcopy(csv_text: &str) -> Result<Vec<HistoricalRecord>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut reader = csv::ReaderBuilder::new()
-        .trim(csv::Trim::All)
-        .from_reader(csv_text.as_bytes());
-        
-    let mut records = Vec::new();
-    for result in reader.records() {
-        let record = result?;
-        if record.len() < 15 {
-            continue;
-        }
-        
-        let symbol = record.get(0).unwrap_or("").to_string();
-        let series = record.get(1).unwrap_or("").to_string();
-        let date_str = record.get(2).unwrap_or("").to_string();
-        
-        let prev_close = record.get(3).unwrap_or("0").parse::<f64>().unwrap_or(0.0);
-        let open = record.get(4).unwrap_or("0").parse::<f64>().unwrap_or(0.0);
-        let high = record.get(5).unwrap_or("0").parse::<f64>().unwrap_or(0.0);
-        let low = record.get(6).unwrap_or("0").parse::<f64>().unwrap_or(0.0);
-        let ltp = record.get(7).unwrap_or("0").parse::<f64>().unwrap_or(0.0);
-        let close = record.get(8).unwrap_or("0").parse::<f64>().unwrap_or(0.0);
-        
-        let volume = record.get(10).unwrap_or("0").parse::<f64>().unwrap_or(0.0) as u64;
-        let value = record.get(11).unwrap_or("0").parse::<f64>().unwrap_or(0.0);
-        
-        records.push(HistoricalRecord {
-            date: date_str,
-            symbol,
-            series,
-            open,
-            high,
-            low,
-            close,
-            previous_close: prev_close,
-            ltp,
-            volume,
-            value,
+// ── Parsers ───────────────────────────────────────────────────────────────────
+
+fn parse_full_bhavcopy(csv: &str) -> Result<Vec<HistoricalRecord>> {
+    let mut rdr = csv::ReaderBuilder::new().trim(csv::Trim::All).from_reader(csv.as_bytes());
+    let mut out = Vec::new();
+    for result in rdr.records() {
+        let r = result.context("csv record")?;
+        if r.len() < 15 { continue; }
+        out.push(HistoricalRecord {
+            symbol:         get(&r, 0),
+            series:         get(&r, 1),
+            date:           get(&r, 2),
+            previous_close: pf64(&r, 3),
+            open:           pf64(&r, 4),
+            high:           pf64(&r, 5),
+            low:            pf64(&r, 6),
+            ltp:            pf64(&r, 7),
+            close:          pf64(&r, 8),
+            volume:         pf64(&r, 10) as u64,
+            value:          pf64(&r, 11),
         });
     }
-    Ok(records)
+    Ok(out)
 }
 
-/// Parse zipped bhavcopy CSV text (different headers)
-fn parse_zipped_bhavcopy(csv_text: &str, date: NaiveDate) -> Result<Vec<HistoricalRecord>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut reader = csv::ReaderBuilder::new()
-        .trim(csv::Trim::All)
-        .from_reader(csv_text.as_bytes());
-        
+fn parse_zipped_bhavcopy(csv: &str, date: NaiveDate) -> Result<Vec<HistoricalRecord>> {
+    let mut rdr = csv::ReaderBuilder::new().trim(csv::Trim::All).from_reader(csv.as_bytes());
     let date_str = date.format("%d-%b-%Y").to_string();
-    let mut records = Vec::new();
-    
-    for result in reader.records() {
-        let record = result?;
-        if record.len() < 13 {
-            continue;
-        }
-        
-        let symbol = record.get(0).unwrap_or("").to_string();
-        let series = record.get(1).unwrap_or("").to_string();
-        
-        let open = record.get(2).unwrap_or("0").parse::<f64>().unwrap_or(0.0);
-        let high = record.get(3).unwrap_or("0").parse::<f64>().unwrap_or(0.0);
-        let low = record.get(4).unwrap_or("0").parse::<f64>().unwrap_or(0.0);
-        let close = record.get(5).unwrap_or("0").parse::<f64>().unwrap_or(0.0);
-        let last = record.get(6).unwrap_or("0").parse::<f64>().unwrap_or(0.0);
-        let prev_close = record.get(7).unwrap_or("0").parse::<f64>().unwrap_or(0.0);
-        
-        let volume = record.get(8).unwrap_or("0").parse::<f64>().unwrap_or(0.0) as u64;
-        let value = record.get(9).unwrap_or("0").parse::<f64>().unwrap_or(0.0);
-        
-        records.push(HistoricalRecord {
-            date: date_str.clone(),
-            symbol,
-            series,
-            open,
-            high,
-            low,
-            close,
-            previous_close: prev_close,
-            ltp: last,
-            volume,
-            value,
+    let mut out = Vec::new();
+    for result in rdr.records() {
+        let r = result.context("csv record")?;
+        if r.len() < 13 { continue; }
+        out.push(HistoricalRecord {
+            symbol:         get(&r, 0),
+            series:         get(&r, 1),
+            date:           date_str.clone(),
+            open:           pf64(&r, 2),
+            high:           pf64(&r, 3),
+            low:            pf64(&r, 4),
+            close:          pf64(&r, 5),
+            ltp:            pf64(&r, 6),
+            previous_close: pf64(&r, 7),
+            volume:         pf64(&r, 8) as u64,
+            value:          pf64(&r, 9),
         });
     }
-    Ok(records)
+    Ok(out)
+}
+
+/// Post-July-2024 UDiFF format columns:
+/// FinInstrmNm, XpryDt, OptnTp, StrkPric, OpnPric, HghPric, LwPric, ClsPric,
+/// SttlmPric, TtlTradgVol, OpnIntrst, ChngInOpnIntrst, ...
+fn parse_fo_udiff(csv: &str) -> Result<Vec<FoBhavRecord>> {
+    let mut rdr = csv::ReaderBuilder::new().trim(csv::Trim::All).from_reader(csv.as_bytes());
+    let mut out = Vec::new();
+    for result in rdr.records() {
+        let r = result.context("csv record")?;
+        if r.len() < 12 { continue; }
+        let instrument_type = infer_instrument_type(get(&r, 0).as_str(), get(&r, 2).as_str());
+        out.push(FoBhavRecord {
+            symbol:          get(&r, 0),
+            expiry:          get(&r, 1),
+            instrument_type,
+            option_type:     get(&r, 2),
+            strike:          pf64(&r, 3),
+            open:            pf64(&r, 4),
+            high:            pf64(&r, 5),
+            low:             pf64(&r, 6),
+            close:           pf64(&r, 7),
+            settle_price:    pf64(&r, 8),
+            contracts:       pf64(&r, 9) as u64,
+            oi:              pf64(&r, 10) as u64,
+            change_in_oi:    pf64(&r, 11) as i64,
+        });
+    }
+    Ok(out)
+}
+
+/// Legacy format columns:
+/// INSTRUMENT,SYMBOL,EXPIRY_DT,STRIKE_PR,OPTION_TYP,OPEN,HIGH,LOW,CLOSE,SETTLE_PR,
+/// CONTRACTS,VAL_IN_LAKH,OPEN_INT,CHG_IN_OI,TIMESTAMP
+fn parse_fo_legacy(csv: &str) -> Result<Vec<FoBhavRecord>> {
+    let mut rdr = csv::ReaderBuilder::new().trim(csv::Trim::All).from_reader(csv.as_bytes());
+    let mut out = Vec::new();
+    for result in rdr.records() {
+        let r = result.context("csv record")?;
+        if r.len() < 14 { continue; }
+        out.push(FoBhavRecord {
+            instrument_type: get(&r, 0),
+            symbol:          get(&r, 1),
+            expiry:          get(&r, 2),
+            strike:          pf64(&r, 3),
+            option_type:     get(&r, 4),
+            open:            pf64(&r, 5),
+            high:            pf64(&r, 6),
+            low:             pf64(&r, 7),
+            close:           pf64(&r, 8),
+            settle_price:    pf64(&r, 9),
+            contracts:       pf64(&r, 10) as u64,
+            oi:              pf64(&r, 12) as u64,
+            change_in_oi:    pf64(&r, 13) as i64,
+        });
+    }
+    Ok(out)
+}
+
+fn infer_instrument_type(symbol: &str, option_type: &str) -> String {
+    let is_index = matches!(symbol, "NIFTY" | "BANKNIFTY" | "FINNIFTY" | "MIDCPNIFTY" | "SENSEX");
+    match option_type {
+        "CE" | "PE" => if is_index { "OPTIDX".into() } else { "OPTSTK".into() },
+        _            => if is_index { "FUTIDX".into() } else { "FUTSTK".into() },
+    }
+}
+
+// ── CSV field helpers ─────────────────────────────────────────────────────────
+
+fn get(r: &csv::StringRecord, i: usize) -> String {
+    r.get(i).unwrap_or("").trim().to_string()
+}
+
+fn pf64(r: &csv::StringRecord, i: usize) -> f64 {
+    r.get(i).unwrap_or("0").trim().replace(',', "").parse().unwrap_or(0.0)
 }
