@@ -178,6 +178,11 @@ pub struct DerivativeContract {
     #[serde(rename = "strikePrice", deserialize_with = "deserialize_strike")]
     pub strike_price:                                       f64,
     #[serde(rename = "lastPrice")]              pub last_price:              Option<f64>,
+    #[serde(rename = "openPrice")]              pub open_price:              Option<f64>,
+    #[serde(rename = "highPrice")]              pub high_price:              Option<f64>,
+    #[serde(rename = "lowPrice")]               pub low_price:               Option<f64>,
+    #[serde(rename = "closePrice")]             pub close_price:             Option<f64>,
+    #[serde(rename = "prevClose")]              pub prev_close:              Option<f64>,
     #[serde(rename = "openInterest")]           pub open_interest:           Option<f64>,
     #[serde(rename = "changeinOpenInterest")]   pub change_in_open_interest: Option<f64>,
     #[serde(rename = "pchangeinOpenInterest")]  pub p_change_in_open_interest: Option<f64>,
