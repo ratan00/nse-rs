@@ -164,30 +164,33 @@ fn parse_zipped_bhavcopy(csv: &str, date: NaiveDate) -> Result<Vec<HistoricalRec
     Ok(out)
 }
 
-/// Post-July-2024 UDiFF format columns:
-/// FinInstrmNm, XpryDt, OptnTp, StrkPric, OpnPric, HghPric, LwPric, ClsPric,
-/// SttlmPric, TtlTradgVol, OpnIntrst, ChngInOpnIntrst, ...
+/// Post-July-2024 UDiFF format (34 columns):
+/// TradDt, BizDt, Sgmt, Src, FinInstrmTp, FinInstrmId, ISIN, TckrSymb,
+/// SctySrs, XpryDt, FininstrmActlXpryDt, StrkPric, OptnTp, FinInstrmNm,
+/// OpnPric, HghPric, LwPric, ClsPric, LastPric, PrvsClsgPric, UndrlygPric,
+/// SttlmPric, OpnIntrst, ChngInOpnIntrst, TtlTradgVol, TtlTrfVal,
+/// TtlNbOfTxsExctd, SsnId, NewBrdLotQty, Rmks, Rsvd1, Rsvd2, Rsvd3, Rsvd4
 fn parse_fo_udiff(csv: &str) -> Result<Vec<FoBhavRecord>> {
     let mut rdr = csv::ReaderBuilder::new().trim(csv::Trim::All).from_reader(csv.as_bytes());
     let mut out = Vec::new();
     for result in rdr.records() {
         let r = result.context("csv record")?;
-        if r.len() < 12 { continue; }
-        let instrument_type = infer_instrument_type(get(&r, 0).as_str(), get(&r, 2).as_str());
+        if r.len() < 25 { continue; }
+        let instrument_type = infer_instrument_type(get(&r, 7).as_str(), get(&r, 12).as_str());
         out.push(FoBhavRecord {
-            symbol:          get(&r, 0),
-            expiry:          get(&r, 1),
+            symbol:          get(&r, 7),   // TckrSymb
+            expiry:          get(&r, 9),   // XpryDt
             instrument_type,
-            option_type:     get(&r, 2),
-            strike:          pf64(&r, 3),
-            open:            pf64(&r, 4),
-            high:            pf64(&r, 5),
-            low:             pf64(&r, 6),
-            close:           pf64(&r, 7),
-            settle_price:    pf64(&r, 8),
-            contracts:       pf64(&r, 9) as u64,
-            oi:              pf64(&r, 10) as u64,
-            change_in_oi:    pf64(&r, 11) as i64,
+            option_type:     get(&r, 12),  // OptnTp
+            strike:          pf64(&r, 11), // StrkPric
+            open:            pf64(&r, 14), // OpnPric
+            high:            pf64(&r, 15), // HghPric
+            low:             pf64(&r, 16), // LwPric
+            close:           pf64(&r, 17), // ClsPric
+            settle_price:    pf64(&r, 21), // SttlmPric
+            contracts:       pf64(&r, 24) as u64, // TtlTradgVol
+            oi:              pf64(&r, 22) as u64, // OpnIntrst
+            change_in_oi:    pf64(&r, 23) as i64, // ChngInOpnIntrst
         });
     }
     Ok(out)
