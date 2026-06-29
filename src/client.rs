@@ -1,11 +1,13 @@
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use std::sync::RwLock;
+use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use reqwest::Client;
 use reqwest::header::{HeaderMap, HeaderValue};
 use tokio::sync::mpsc;
-use tokio::time::{interval, Duration};
+use tokio::time::{interval};
 use crate::models::{
     ChartCandle, DerivativeContract, FoBhavRecord, HistoricalRecord,
     NextApiDerivativesResponse, NextApiQuoteResponse, NseIndexQuote, NseQuote,
@@ -13,6 +15,17 @@ use crate::models::{
 };
 use crate::session::{load_session_cache, save_session_cache, fetch_new_cookies};
 use crate::{live, historical, archives};
+
+/// Process-wide cache for `get_derivatives_quote` responses keyed by uppercase
+/// underlying symbol.  Three independent callers (live feed, chain pane, gamma
+/// poller) all hit this endpoint within the same ~3 s window; the cache
+/// deduplicates those calls so only one HTTP request is made per TTL window.
+type DerivCache = Mutex<HashMap<String, (Instant, NextApiDerivativesResponse)>>;
+
+fn deriv_cache() -> &'static DerivCache {
+    static CACHE: OnceLock<DerivCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// Cached charting token for a symbol: `(charting_symbol, scripcode, instrument_type)`.
 type TokenEntry = (String, String, String);
@@ -125,13 +138,30 @@ impl NseClient {
     // ── Derivatives ───────────────────────────────────────────────────────────
 
     pub async fn get_derivatives_quote(&self, symbol: &str) -> Result<NextApiDerivativesResponse> {
+        let key = symbol.to_uppercase();
+        const TTL: Duration = Duration::from_secs(2);
+        // Fast path: check the process-wide cache (3 callers hit this within ~3s).
+        {
+            let cache = deriv_cache().lock().unwrap();
+            if let Some((ts, cached)) = cache.get(&key) {
+                if ts.elapsed() < TTL {
+                    return Ok(cached.clone());
+                }
+            }
+        }
+        // Slow path: fetch from NSE, cache on success regardless of data freshness
+        // (NSE returns stale prev-close data outside market hours; we still cache it).
         let sym = symbol.to_string();
-        self.with_session_retry(|c| {
+        let resp = self.with_session_retry(|c| {
             let sym = sym.clone();
             let client = self.client.clone();
             async move { live::get_derivatives_quote(&client, &c, &sym).await }
-        })
-        .await
+        }).await?;
+        {
+            let mut cache = deriv_cache().lock().unwrap();
+            cache.insert(key, (Instant::now(), resp.clone()));
+        }
+        Ok(resp)
     }
 
     pub async fn get_futures(&self, symbol: &str) -> Result<Vec<DerivativeContract>> {
