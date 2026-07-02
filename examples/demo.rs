@@ -70,13 +70,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Err(e) => println!("Error fetching option chain: {}", e),
     }
 
-    // 3. Fetch historical charting data (intraday 5m candles)
-    println!("\n--- Testing Intraday Charting Candles (SBIN) ---");
+    // 3. Fetch historical charting data (Daily EOD candles)
+    println!("\n--- Testing Daily Charting Candles (NIFTY) ---");
     let end_time = Utc::now();
-    let start_time = end_time - Duration::days(5);
-    match client.get_historical_candles("SBIN", start_time, end_time, "5").await {
+    let start_time = end_time - Duration::days(45);
+    match client.get_historical_candles("NIFTY", start_time, end_time, "D").await {
         Ok(candles) => {
-            println!("Retrieved {} intraday 5-minute candles.", candles.len());
+            println!("Retrieved {} daily candles.", candles.len());
             if !candles.is_empty() {
                 println!("First candle: {:?}", candles.first().unwrap());
                 println!("Last candle: {:?}", candles.last().unwrap());
