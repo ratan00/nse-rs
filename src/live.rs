@@ -11,6 +11,18 @@ const NEXT_API_URL: &str    = "https://www.nseindia.com/api/NextApi/apiClient/Ge
 const MARKET_STATUS_URL: &str = "https://www.nseindia.com/api/marketStatus";
 const INDEX_API_URL: &str   = "https://www.nseindia.com/api/allIndices";
 
+/// Millisecond epoch string used as a `_=` query param to defeat NSE's
+/// CDN/server response cache — without it these endpoints return a stale
+/// snapshot (LTP/volume frozen for tens of seconds), which starves the live
+/// candle feed of the price/volume changes it needs to build bars.
+fn cache_buster() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+        .to_string()
+}
+
 pub async fn get_market_status(
     client: &Client,
     cookies: &HashMap<String, String>,
@@ -34,14 +46,17 @@ pub async fn get_stock_quote(
     symbol: &str,
 ) -> Result<NextApiQuoteResponse> {
     let cookie_val = format_cookie_header(cookies);
+    let bust = cache_buster();
     client
         .get(NEXT_API_URL)
         .header(COOKIE, cookie_val)
+        .header(reqwest::header::CACHE_CONTROL, "no-cache")
         .query(&[
             ("functionName", "getSymbolData"),
             ("marketType", "N"),
             ("series", "EQ"),
             ("symbol", symbol),
+            ("_", &bust),
         ])
         .send()
         .await
@@ -58,12 +73,15 @@ pub async fn get_derivatives_quote(
     symbol: &str,
 ) -> Result<NextApiDerivativesResponse> {
     let cookie_val = format_cookie_header(cookies);
+    let bust = cache_buster();
     client
         .get(NEXT_API_URL)
         .header(COOKIE, cookie_val)
+        .header(reqwest::header::CACHE_CONTROL, "no-cache")
         .query(&[
             ("functionName", "getSymbolDerivativesData"),
             ("symbol", symbol),
+            ("_", &bust),
         ])
         .send()
         .await
@@ -81,9 +99,11 @@ pub async fn get_index_quote(
     index_name: &str,
 ) -> Result<NseIndexQuote> {
     let cookie_val = format_cookie_header(cookies);
+    let url = format!("{INDEX_API_URL}?_={}", cache_buster());
     let resp: IndexApiResponse = client
-        .get(INDEX_API_URL)
+        .get(&url)
         .header(COOKIE, cookie_val)
+        .header(reqwest::header::CACHE_CONTROL, "no-cache")
         .send()
         .await
         .context("index request")?
