@@ -80,9 +80,14 @@ pub fn format_cookie_header(cookies: &HashMap<String, String>) -> HeaderValue {
     HeaderValue::from_str(&cookie_str).unwrap_or_else(|_| HeaderValue::from_static(""))
 }
 
-/// Helper to request cookies from the landing page
+/// Helper to request cookies from the landing page.
+/// Visits the NSE India homepage first to establish the cookie jar context.
 pub async fn fetch_new_cookies(client: &Client) -> Result<HashMap<String, String>, reqwest::Error> {
-    let resp = client.get(SESSION_WARMUP_URL).send().await?;
-    let cookies = extract_cookies(&resp);
+    let mut cookies = HashMap::new();
+    if let Ok(resp1) = client.get("https://www.nseindia.com/").send().await {
+        cookies.extend(extract_cookies(&resp1));
+    }
+    let resp2 = client.get(SESSION_WARMUP_URL).send().await?;
+    cookies.extend(extract_cookies(&resp2));
     Ok(cookies)
 }

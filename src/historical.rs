@@ -131,11 +131,16 @@ pub async fn get_historical_candles(
         let market_open  = NaiveTime::from_hms_opt(9, 15, 0).expect("valid time");
         let market_close = NaiveTime::from_hms_opt(15, 30, 0).expect("valid time");
 
+        let ist_tz = FixedOffset::east_opt(IST_OFFSET_SECS).expect("valid IST offset");
         candles.retain(|c| {
-            Utc.timestamp_opt(c.time / 1000, 0)
+            // c.time is IST-shifted epoch milliseconds (real_utc + IST_OFFSET_SECS)*1000.
+            // Subtract IST_OFFSET_SECS to recover true UTC, then convert to IST for
+            // the time-of-day comparison.
+            let true_utc_secs = (c.time / 1000) - IST_OFFSET_SECS as i64;
+            Utc.timestamp_opt(true_utc_secs, 0)
                 .single()
                 .map(|dt| {
-                    let t = dt.time();
+                    let t = dt.with_timezone(&ist_tz).time();
                     t >= market_open && t < market_close
                 })
                 .unwrap_or(false)
@@ -144,14 +149,16 @@ pub async fn get_historical_candles(
         // Convert cumulative day volume to discrete per-bar volume
         if !candles.is_empty() {
             let mut prev_vol = candles[0].volume;
-            let ist_tz = FixedOffset::east_opt(IST_OFFSET_SECS).expect("valid IST offset");
             for i in 1..candles.len() {
                 let cur_vol = candles[i].volume;
 
-                let prev_dt = Utc.timestamp_opt(candles[i - 1].time / 1000, 0)
+                // Same IST-shifted offset correction as above
+                let prev_true_utc = (candles[i - 1].time / 1000) - IST_OFFSET_SECS as i64;
+                let cur_true_utc  = (candles[i].time     / 1000) - IST_OFFSET_SECS as i64;
+                let prev_dt = Utc.timestamp_opt(prev_true_utc, 0)
                     .single()
                     .map(|dt| dt.with_timezone(&ist_tz).date_naive());
-                let cur_dt = Utc.timestamp_opt(candles[i].time / 1000, 0)
+                let cur_dt = Utc.timestamp_opt(cur_true_utc, 0)
                     .single()
                     .map(|dt| dt.with_timezone(&ist_tz).date_naive());
 
