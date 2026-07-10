@@ -10,7 +10,19 @@ const SESSION_WARMUP_URL: &str = "https://www.nseindia.com/get-quote/equity/RELI
 
 /// Get cache file path in standard local cache directory
 pub fn get_cache_path() -> Option<PathBuf> {
-    dirs::cache_dir().map(|mut p| {
+    let mut base = if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+        if !xdg.is_empty() {
+            Some(PathBuf::from(xdg))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if base.is_none() {
+        base = dirs::cache_dir();
+    }
+    base.map(|mut p| {
         p.push("nse-rs");
         p.push("session.json");
         p
