@@ -50,6 +50,7 @@ impl NseClient {
         let client = Client::builder()
             .default_headers(headers)
             .cookie_store(true)
+            .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(45))
             .build()
             .unwrap_or_default();
@@ -66,7 +67,7 @@ impl NseClient {
     /// Load the session from disk cache or request a fresh one.
     pub async fn init_session(&self) -> Result<()> {
         if let Some(cache) = load_session_cache() {
-            *self.cookies.write().unwrap() = cache.cookies;
+            *self.cookies.write().unwrap_or_else(|e| e.into_inner()) = cache.cookies;
             return Ok(());
         }
         self.force_refresh_session().await
@@ -78,12 +79,12 @@ impl NseClient {
             .await
             .context("fetch session cookies")?;
         save_session_cache(&fresh);
-        *self.cookies.write().unwrap() = fresh;
+        *self.cookies.write().unwrap_or_else(|e| e.into_inner()) = fresh;
         Ok(())
     }
 
     fn cookies(&self) -> HashMap<String, String> {
-        self.cookies.read().unwrap().clone()
+        self.cookies.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Run `f(cookies)` and on session-related failure refresh once and retry.
@@ -142,7 +143,7 @@ impl NseClient {
         const TTL: Duration = Duration::from_secs(2);
         // Fast path: check the process-wide cache (3 callers hit this within ~3s).
         {
-            let cache = deriv_cache().lock().unwrap();
+            let cache = deriv_cache().lock().unwrap_or_else(|e| e.into_inner());
             if let Some((ts, cached)) = cache.get(&key) {
                 if ts.elapsed() < TTL {
                     return Ok(cached.clone());
@@ -158,7 +159,7 @@ impl NseClient {
             async move { live::get_derivatives_quote(&client, &c, &sym).await }
         }).await?;
         {
-            let mut cache = deriv_cache().lock().unwrap();
+            let mut cache = deriv_cache().lock().unwrap_or_else(|e| e.into_inner());
             cache.insert(key, (Instant::now(), resp.clone()));
         }
         Ok(resp)
@@ -209,12 +210,12 @@ impl NseClient {
         let sym = symbol.to_string();
         let int = interval.to_string();
         // Check token cache first to skip the extra search request.
-        let cached = self.token_cache.read().unwrap().get(&sym.to_uppercase()).cloned();
+        let cached = self.token_cache.read().unwrap_or_else(|e| e.into_inner()).get(&sym.to_uppercase()).cloned();
         if cached.is_none() {
             // Warm the token cache.
             let cookies = self.cookies();
             if let Ok(entry) = historical::get_script_token(&self.client, &cookies, &sym).await {
-                self.token_cache.write().unwrap().insert(sym.to_uppercase(), entry);
+                self.token_cache.write().unwrap_or_else(|e| e.into_inner()).insert(sym.to_uppercase(), entry);
             }
         }
         self.with_session_retry(|c| {
@@ -239,13 +240,16 @@ impl NseClient {
         interval_ms: u64,
         tx: mpsc::Sender<NseQuote>,
     ) {
-        let mut ticker = interval(Duration::from_millis(interval_ms));
+        let mut ticker = interval(Duration::from_millis(interval_ms.max(1)));
         loop {
             ticker.tick().await;
             if tx.is_closed() { break; }
             match self.get_stock_quote(symbol).await {
                 Ok(q)  => { if tx.send(q).await.is_err() { break; } }
-                Err(e) => { eprintln!("poll_quote error for {symbol}: {e:#}"); }
+                Err(e) => {
+                    eprintln!("poll_quote error for {symbol}: {e:#}");
+                    ticker.reset();
+                }
             }
         }
     }
@@ -257,7 +261,7 @@ impl NseClient {
         interval_ms: u64,
         tx: mpsc::Sender<NseIndexQuote>,
     ) {
-        let mut ticker = interval(Duration::from_millis(interval_ms));
+        let mut ticker = interval(Duration::from_millis(interval_ms.max(1)));
         loop {
             ticker.tick().await;
             if tx.is_closed() { break; }
@@ -277,6 +281,25 @@ impl NseClient {
                 live::get_market_status(&client, &c)
                     .await
             }
+        })
+        .await
+    }
+
+    // ── Holidays ──────────────────────────────────────────────────────────────
+
+    /// NSE equity ("CM") and F&O ("FO") trading holidays for the current IST year.
+    pub async fn get_trading_holidays(&self) -> Result<crate::holidays::TradingHolidays> {
+        self.get_trading_holidays_for_year(Some(crate::holidays::current_year_ist())).await
+    }
+
+    /// Same as [`Self::get_trading_holidays`] but for a given year (`None` = every year NSE returns).
+    pub async fn get_trading_holidays_for_year(
+        &self,
+        year: Option<i32>,
+    ) -> Result<crate::holidays::TradingHolidays> {
+        self.with_session_retry(|c| {
+            let client = self.client.clone();
+            async move { crate::holidays::fetch_trading_holidays(&client, &c, year).await }
         })
         .await
     }

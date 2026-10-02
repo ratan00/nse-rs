@@ -4,8 +4,10 @@ pub mod live;
 pub mod historical;
 pub mod archives;
 pub mod client;
+pub mod holidays;
 
 pub use client::NseClient;
+pub use holidays::{NseHoliday, TradingHolidays};
 pub use models::{
     // Session
     SessionCache,

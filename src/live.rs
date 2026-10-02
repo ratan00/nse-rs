@@ -34,6 +34,8 @@ pub async fn get_market_status(
         .send()
         .await
         .context("market status request")?
+        .error_for_status()
+        .context("NSE returned an error status (session may have expired)")?
         .json()
         .await
         .context("market status decode")
@@ -61,6 +63,8 @@ pub async fn get_stock_quote(
         .send()
         .await
         .context("quote request")?
+        .error_for_status()
+        .context("NSE returned an error status (session may have expired)")?
         .json()
         .await
         .context("quote decode")
@@ -86,6 +90,8 @@ pub async fn get_derivatives_quote(
         .send()
         .await
         .context("derivatives request")?
+        .error_for_status()
+        .context("NSE returned an error status (session may have expired)")?
         .json()
         .await
         .context("derivatives decode")
@@ -107,6 +113,8 @@ pub async fn get_index_quote(
         .send()
         .await
         .context("index request")?
+        .error_for_status()
+        .context("NSE returned an error status (session may have expired)")?
         .json()
         .await
         .context("index decode")?;
