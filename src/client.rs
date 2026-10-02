@@ -144,10 +144,10 @@ impl NseClient {
         // Fast path: check the process-wide cache (3 callers hit this within ~3s).
         {
             let cache = deriv_cache().lock().unwrap_or_else(|e| e.into_inner());
-            if let Some((ts, cached)) = cache.get(&key) {
-                if ts.elapsed() < TTL {
-                    return Ok(cached.clone());
-                }
+            if let Some((ts, cached)) = cache.get(&key)
+                && ts.elapsed() < TTL
+            {
+                return Ok(cached.clone());
             }
         }
         // Slow path: fetch from NSE, cache on success regardless of data freshness

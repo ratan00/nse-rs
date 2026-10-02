@@ -127,4 +127,17 @@ mod tests {
         let h = parse_trading_holidays("{}", None).unwrap();
         assert!(h.equity.is_empty() && h.fno.is_empty());
     }
+
+    /// An excerpt of NSE's real `holiday-master?type=trading` response
+    /// (fetched 2026-10-02): other segments, null session fields, `Sr_no`.
+    const REAL_EXCERPT: &str = r#"{"CBM": [{"tradingDate": "15-Jan-2026", "weekDay": "Thursday", "description": "Municipal Corporation Election - Maharashtra", "morning_session": null, "evening_session": null, "Sr_no": 1}, {"tradingDate": "26-Jan-2026", "weekDay": "Monday", "description": "Republic Day", "morning_session": null, "evening_session": null, "Sr_no": 2}], "CM": [{"tradingDate": "15-Jan-2026", "weekDay": "Thursday", "description": "Municipal Corporation Election - Maharashtra", "morning_session": null, "evening_session": null, "Sr_no": 1}, {"tradingDate": "26-Jan-2026", "weekDay": "Monday", "description": "Republic Day", "morning_session": null, "evening_session": null, "Sr_no": 2}], "FO": [{"tradingDate": "15-Jan-2026", "weekDay": "Thursday", "description": "Municipal Corporation Election - Maharashtra", "morning_session": null, "evening_session": null, "Sr_no": 1}, {"tradingDate": "26-Jan-2026", "weekDay": "Monday", "description": "Republic Day", "morning_session": null, "evening_session": null, "Sr_no": 2}, {"tradingDate": "02-Oct-2026", "weekDay": "Friday", "description": "Mahatma Gandhi Jayanti", "morning_session": null, "evening_session": null, "Sr_no": 15}]}"#;
+
+    #[test]
+    fn parses_real_nse_response() {
+        let h = parse_trading_holidays(REAL_EXCERPT, Some(2026)).unwrap();
+        assert_eq!(h.equity.len(), 2);
+        assert_eq!(h.fno.len(), 3);
+        assert_eq!(h.fno[2].date, NaiveDate::from_ymd_opt(2026, 10, 2).unwrap());
+        assert_eq!(h.fno[2].description, "Mahatma Gandhi Jayanti");
+    }
 }

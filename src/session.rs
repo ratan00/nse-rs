@@ -71,13 +71,10 @@ pub fn save_session_cache(cookies: &HashMap<String, String>) -> Option<()> {
 pub fn extract_cookies(response: &reqwest::Response) -> HashMap<String, String> {
     let mut cookies = HashMap::new();
     for header_val in response.headers().get_all(SET_COOKIE) {
-        if let Ok(cookie_str) = header_val.to_str() {
-            if let Some(first_part) = cookie_str.split(';').next() {
-                let mut parts = first_part.splitn(2, '=');
-                if let (Some(name), Some(val)) = (parts.next(), parts.next()) {
-                    cookies.insert(name.trim().to_string(), val.trim().to_string());
-                }
-            }
+        if let Ok(cookie_str) = header_val.to_str()
+            && let Some((name, val)) = cookie_str.split(';').next().and_then(|p| p.split_once('='))
+        {
+            cookies.insert(name.trim().to_string(), val.trim().to_string());
         }
     }
     cookies
