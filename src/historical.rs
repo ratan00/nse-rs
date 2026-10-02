@@ -43,6 +43,8 @@ pub async fn get_script_token(
         .send()
         .await
         .context("symbol search request")?
+        .error_for_status()
+        .context("NSE charting returned an error status")?
         .json()
         .await
         .context("symbol search decode")?;
@@ -121,6 +123,8 @@ pub async fn get_historical_candles(
         .send()
         .await
         .context("historical data request")?
+        .error_for_status()
+        .context("NSE charting returned an error status")?
         .json()
         .await
         .context("historical data decode")?;
