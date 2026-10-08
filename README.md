@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/ratan00/nse-rs"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License" /></a>
-  <img src="https://img.shields.io/badge/Rust-1.75%2B-orange.svg" alt="Rust Version" />
+  <img src="https://img.shields.io/badge/Rust-1.88%2B-orange.svg" alt="Rust Version" />
   <img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome" />
 </p>
 
@@ -12,24 +12,24 @@
 
 An async Rust library for fetching live market data from the National Stock Exchange of India (NSE) — no API key or account required.
 
-Provides live equity quotes, index quotes, structured option chains, futures, intraday & historical candles, polling feed loops, and EOD bhavcopy archives.
+Provides live equity quotes, index quotes, structured option chains, futures, intraday & historical candles (stocks, indices, futures, options), continuous futures series, polling feed loops, and EOD bhavcopy archives — with built-in rate limiting so you don't get your IP blocked.
 
 ---
 
 ## Features
 
 - **Live equity quotes** — flat `NseQuote` with LTP, OHLCV, change, volume
-- **Live index quotes** — NIFTY 50, NIFTY BANK, FINNIFTY etc. via `get_index_quote()`
+- **Live index quotes** — NIFTY 50, NIFTY BANK, INDIA VIX etc.; one or many indices per request
 - **Structured option chain** — `OptionChain` grouped by expiry date → strike → CE/PE
 - **Futures** — all contracts for a symbol filtered from derivatives
 - **Continuous futures** — daily front-month series stitched across expiries (expiry / days-before / OI / volume roll; ratio or difference back-adjustment), back to 2010
-- **Historical candles** — 1/3/5/15/30/60 min intraday (30-day window) or D/W/M (25+ years)
+- **Historical candles** — 1/3/5/15/30/60 min intraday (30-day window) or D/W/M (25+ years) for stocks, indices, live futures and options, with correct per-bar volume
 - **Polling feed** — `poll_quote()`, `poll_index()` and `poll_indices()` loops with error backoff
 - **Built-in rate limiting** — paced, concurrency-capped requests with client-wide cool-down when NSE pushes back
 - **EOD bhavcopy** — equity and F&O archives parsed into typed structs
 - **Script token cache** — symbol → charting token cached in memory; repeat candle calls cost one request
 - **Auto session retry** — one shared cookie refresh on 403/decode failures, backoff on 429/5xx, disk-cached for 1 hour
-- **No OpenSSL** — uses `rustls-tls-native-roots`; cross-compiles cleanly
+- **No OpenSSL** — uses `rustls` with bundled webpki roots; cross-compiles cleanly (incl. Android)
 
 ---
 
@@ -149,13 +149,35 @@ let candles = client.get_historical_candles("SBIN", start, end, "5").await?;
 
 // Daily candles going back years
 let daily = client.get_historical_candles("NIFTY", start, end, "D").await?;
+
+// Live futures and option contracts, and India VIX
+let fut = client.get_historical_candles("NIFTY26OCTFUT",     start, end, "5").await?;
+let opt = client.get_historical_candles("NIFTY26OCT22500CE", start, end, "5").await?; // monthly
+let wk  = client.get_historical_candles("NIFTY26O1322250CE", start, end, "5").await?; // weekly, 13-Oct
+let vix = client.get_historical_candles("INDIA VIX",         start, end, "5").await?;
 ```
+
+Symbol formats:
+
+| Instrument | Format | Example |
+|---|---|---|
+| Stock / index | NSE name | `"SBIN"`, `"NIFTY 50"`, `"NIFTY BANK"` |
+| Future | `SYMBOL` + `YY` + `MON` + `FUT` | `NIFTY26OCTFUT`, `BANKNIFTY26NOVFUT` |
+| Monthly option | `SYMBOL` + `YY` + `MON` + strike + `CE`/`PE` | `NIFTY26OCT22500CE` |
+| Weekly option | `SYMBOL` + `YY` + month code + `DD` + strike + `CE`/`PE` | `NIFTY26O1322250CE` |
+
+The weekly month code is `1`–`9` for Jan–Sep, then `O`, `N`, `D`. Only **currently listed** contracts are available — NSE drops expired contracts from the charting API (use [continuous futures](#continuous-futures) for history).
 
 Supported intervals: `"1"` `"3"` `"5"` `"15"` `"30"` `"60"` (minutes, max 30-day window) or `"D"` `"W"` `"M"` (unlimited history).
 
 Intraday candles are automatically filtered to 09:15–15:30 IST, so pre-open volume is excluded.
 
-**Intraday volume** is per bar. NSE's raw feed puts (roughly) the whole day's volume in the final bar of each day; the library detects that bar and replaces its volume with the day total minus the other bars, clamped at 0. Treat the last bar's volume of each day as an estimate. Summed bar volume lands close to the daily candle's volume, minus post-close session trades.
+**Volume by instrument:**
+- **Stocks, futures, options:** real per-bar volume, in units (shares / quantity, not lots).
+- **Indices (NIFTY 50, NIFTY BANK, …):** intraday volume is always **0** — an index isn't traded. Daily candles do carry volume. For an intraday volume proxy use the near-month future.
+- **INDIA VIX:** volume 0, and charting prices come back ×100 (`1412.5` = 14.125).
+
+**Stock intraday volume:** NSE's raw feed puts (roughly) the whole day's volume in the final bar of each day; the library detects that bar and replaces its volume with the day total minus the other bars, clamped at 0. Treat the last bar's volume of each day as an estimate. Summed bar volume lands close to the daily candle's volume, minus post-close session trades.
 
 #### Continuous futures
 
@@ -254,6 +276,36 @@ pub struct OptionSide {
 }
 ```
 
+### `ContinuousFutures`
+```rust
+pub struct ContinuousFutures {
+    pub symbol: String,
+    pub bars:   Vec<ContinuousBar>,
+    pub rolls:  Vec<RollEvent>,
+}
+
+pub struct ContinuousBar {
+    pub date:      NaiveDate,
+    pub open:      f64,   // adjusted
+    pub high:      f64,
+    pub low:       f64,
+    pub close:     f64,
+    pub settle:    f64,
+    pub volume:    f64,   // held contract's own value, units
+    pub oi:        f64,   // held contract's own value, units
+    pub contract:  NaiveDate, // expiry of the held contract
+    pub raw_close: f64,   // unadjusted close
+}
+
+pub struct RollEvent {
+    pub date:       NaiveDate, // first day on the new contract
+    pub from:       NaiveDate,
+    pub to:         NaiveDate,
+    pub from_close: f64,
+    pub to_close:   f64,
+}
+```
+
 ### `FoBhavRecord`
 ```rust
 pub struct FoBhavRecord {
@@ -292,16 +344,20 @@ NSE's web APIs require browser cookies (`nsit`, `nseappid`, etc.) obtained by hi
 - **Geo-blocking** — requests from IPs outside India are frequently rejected with 403 or TCP resets
 - **Cloud IP blocking** — AWS, GCP, Azure, DigitalOcean and similar data-centre ranges are blocked even within India
 
-**Run from a residential Indian internet connection.** Residential proxies are an alternative.
+**Run from a residential Indian internet connection.** Residential proxies are an alternative. Blocking isn't uniform — some cloud IPs get through to the JSON APIs even when the homepage returns 403 — so test from your actual host (`cargo run --example stress`).
 
 The archive domain `nsearchives.nseindia.com` (bhavcopy downloads) does **not** have these restrictions and works globally.
 
 ---
 
-## Running the Example
+## Examples
 
 ```bash
-cargo run --example demo
+cargo run --example demo                  # quotes, derivatives, option chain, candles, archives
+cargo run --example continuous_futures -- NIFTY 2025-01-01 2026-10-08
+cargo run --example stress -- 20 40       # find your IP's request-rate ceiling
+cargo run --example fetch_symbols         # all trading symbols from the bhavcopy
+cargo run --example test_market_status
 ```
 
 ---
