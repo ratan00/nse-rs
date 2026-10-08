@@ -22,6 +22,7 @@ Provides live equity quotes, index quotes, structured option chains, futures, in
 - **Live index quotes** — NIFTY 50, NIFTY BANK, FINNIFTY etc. via `get_index_quote()`
 - **Structured option chain** — `OptionChain` grouped by expiry date → strike → CE/PE
 - **Futures** — all contracts for a symbol filtered from derivatives
+- **Continuous futures** — daily front-month series stitched across expiries (expiry / days-before / OI / volume roll; ratio or difference back-adjustment), back to 2010
 - **Historical candles** — 1/3/5/15/30/60 min intraday (30-day window) or D/W/M (25+ years)
 - **Polling feed** — `poll_quote()`, `poll_index()` and `poll_indices()` loops with error backoff
 - **Built-in rate limiting** — paced, concurrency-capped requests with client-wide cool-down when NSE pushes back
@@ -155,6 +156,36 @@ Supported intervals: `"1"` `"3"` `"5"` `"15"` `"30"` `"60"` (minutes, max 30-day
 Intraday candles are automatically filtered to 09:15–15:30 IST, so pre-open volume is excluded.
 
 **Intraday volume** is per bar. NSE's raw feed puts (roughly) the whole day's volume in the final bar of each day; the library detects that bar and replaces its volume with the day total minus the other bars, clamped at 0. Treat the last bar's volume of each day as an estimate. Summed bar volume lands close to the daily candle's volume, minus post-close session trades.
+
+#### Continuous futures
+
+```rust
+use chrono::NaiveDate;
+use nse_rs::{Adjustment, ContinuousOptions, RollRule};
+
+let from = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+let to   = NaiveDate::from_ymd_opt(2026, 10, 8).unwrap();
+
+let series = client.get_continuous_futures("NIFTY", from, to, ContinuousOptions {
+    roll:       RollRule::OpenInterest,   // or Expiry, DaysBeforeExpiry(n), Volume
+    adjustment: Adjustment::Ratio,        // or Difference, None
+}).await?;
+
+for b in &series.bars {
+    println!("{} {:.2} (raw {:.2}) contract {}", b.date, b.close, b.raw_close, b.contract);
+}
+for r in &series.rolls {
+    println!("roll {}: {} → {} gap {:+.2}", r.date, r.from, r.to, r.to_close - r.from_close);
+}
+```
+
+- **Roll rules:** `Expiry` holds each contract through expiry day. `DaysBeforeExpiry(n)` switches once fewer than `n` trading days remain. `OpenInterest` and `Volume` switch the first day the next contract overtakes the current one.
+- **Adjustment:** older segments are shifted so the latest segment keeps real prices. `Ratio` preserves % returns; `Difference` preserves point moves. `raw_close`, `volume` and `oi` are always the held contract's own values.
+- **Raw contracts:** `get_futures_daily_history(symbol, from, to)` returns every contract's daily OHLC / settle / volume / OI (volume and OI in units; divide by `lot_size` for contracts).
+- **Cost:** data comes from NSE's `foCPV` endpoint in 20-day windows (NSE caps each response at 70 rows), about 13 requests per year of history.
+- **Daily only:** NSE serves no intraday candles for expired contracts, so intraday series can't be stitched.
+
+Run it: `cargo run --example continuous_futures -- NIFTY 2025-01-01 2026-10-08`
 
 #### EOD archives
 

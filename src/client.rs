@@ -15,7 +15,8 @@ use crate::models::{
 };
 use crate::ratelimit::{backoff, RateLimiter};
 use crate::session::{load_session_cache, save_session_cache, fetch_new_cookies};
-use crate::{live, historical, archives};
+use crate::{live, historical, archives, futures};
+use crate::futures::{ContinuousFutures, ContinuousOptions, FuturesDailyRecord, FO_CPV_ROW_CAP};
 
 /// How long a `get_derivatives_quote` response is reused.
 const DERIV_TTL: Duration = Duration::from_secs(2);
@@ -431,6 +432,66 @@ impl NseClient {
             self.token_cache.write().unwrap_or_else(|e| e.into_inner()).remove(&key);
         }
         result
+    }
+
+    // ── Futures history & continuous series ───────────────────────────────────
+
+    /// Daily OHLC / settle / volume / OI for every futures contract of `symbol`
+    /// (e.g. `"NIFTY"`, `"BANKNIFTY"`, `"RELIANCE"`), including expired ones,
+    /// sorted by date then expiry.  Fetched in 20-day windows (NSE caps each
+    /// response at 70 rows), so ten years is roughly 180 requests.
+    pub async fn get_futures_daily_history(
+        &self,
+        symbol: &str,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<Vec<FuturesDailyRecord>> {
+        const WINDOW_DAYS: i64 = 20;
+        let mut windows = std::collections::VecDeque::new();
+        let mut start = from;
+        while start <= to {
+            let end = (start + chrono::Duration::days(WINDOW_DAYS - 1)).min(to);
+            windows.push_back((start, end));
+            start = end + chrono::Duration::days(1);
+        }
+
+        let mut out = Vec::new();
+        while let Some((a, b)) = windows.pop_front() {
+            let sym = symbol.to_string();
+            let rows = self.request(|client, c| {
+                let sym = sym.clone();
+                async move { futures::fetch_futures_daily_window(&client, &c, &sym, a, b).await }
+            })
+            .await
+            .with_context(|| format!("futures history {symbol} {a}..{b}"))?;
+            if rows.len() >= FO_CPV_ROW_CAP && a < b {
+                // Possibly truncated (NSE keeps the newest rows): split and refetch.
+                let mid = a + chrono::Duration::days((b - a).num_days() / 2);
+                windows.push_front((mid + chrono::Duration::days(1), b));
+                windows.push_front((a, mid));
+                continue;
+            }
+            out.extend(rows);
+        }
+        out.sort_by_key(|r| (r.date, r.expiry));
+        out.dedup_by_key(|r| (r.date, r.expiry));
+        Ok(out)
+    }
+
+    /// Continuous front-month daily futures for `symbol`, stitched across expiries
+    /// with the given roll rule and back-adjustment.  The most recent segment
+    /// keeps real prices; `bars[i].raw_close` and `rolls` show the unadjusted data.
+    ///
+    /// Daily only: NSE serves no intraday data for expired contracts.
+    pub async fn get_continuous_futures(
+        &self,
+        symbol: &str,
+        from: NaiveDate,
+        to: NaiveDate,
+        options: ContinuousOptions,
+    ) -> Result<ContinuousFutures> {
+        let records = self.get_futures_daily_history(symbol, from, to).await?;
+        Ok(futures::stitch_continuous(symbol, &records, options))
     }
 
     // ── Polling live feed ─────────────────────────────────────────────────────

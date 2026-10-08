@@ -6,9 +6,13 @@ pub mod archives;
 pub mod client;
 pub mod holidays;
 pub mod ratelimit;
+pub mod futures;
 
 pub use client::{NseClient, NseConfig, MIN_POLL_INTERVAL_MS};
 pub use holidays::{NseHoliday, TradingHolidays};
+pub use futures::{
+    Adjustment, ContinuousBar, ContinuousFutures, ContinuousOptions, FuturesDailyRecord, RollEvent, RollRule,
+};
 pub use models::{
     // Session
     SessionCache,
