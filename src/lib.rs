@@ -5,8 +5,9 @@ pub mod historical;
 pub mod archives;
 pub mod client;
 pub mod holidays;
+pub mod ratelimit;
 
-pub use client::NseClient;
+pub use client::{NseClient, NseConfig, MIN_POLL_INTERVAL_MS};
 pub use holidays::{NseHoliday, TradingHolidays};
 pub use models::{
     // Session

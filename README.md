@@ -23,10 +23,11 @@ Provides live equity quotes, index quotes, structured option chains, futures, in
 - **Structured option chain** — `OptionChain` grouped by expiry date → strike → CE/PE
 - **Futures** — all contracts for a symbol filtered from derivatives
 - **Historical candles** — 1/3/5/15/30/60 min intraday (30-day window) or D/W/M (25+ years)
-- **Polling feed** — `poll_quote()` and `poll_index()` loops for simulated live streaming
+- **Polling feed** — `poll_quote()`, `poll_index()` and `poll_indices()` loops with error backoff
+- **Built-in rate limiting** — paced, concurrency-capped requests with client-wide cool-down when NSE pushes back
 - **EOD bhavcopy** — equity and F&O archives parsed into typed structs
-- **Script token cache** — symbol → charting token cached in memory; no double-requests
-- **Auto session retry** — cookie refresh on 403/decode failures, disk-cached for 1 hour
+- **Script token cache** — symbol → charting token cached in memory; repeat candle calls cost one request
+- **Auto session retry** — one shared cookie refresh on 403/decode failures, backoff on 429/5xx, disk-cached for 1 hour
 - **No OpenSSL** — uses `rustls-tls-native-roots`; cross-compiles cleanly
 
 ---
@@ -82,12 +83,31 @@ async fn main() -> anyhow::Result<()> {
 
 Create with `NseClient::new()`, then call `init_session().await?` before any data fetch.
 
+#### Rate limiting
+
+Every request (including session refreshes and archive downloads) goes through a client-wide limiter. Defaults: **3 requests/s, 4 in flight**. Tune with `NseConfig`:
+
+```rust
+use nse_rs::{NseClient, NseConfig};
+
+let client = NseClient::with_config(NseConfig {
+    requests_per_sec: 10.0,   // <= 0 disables pacing
+    max_concurrent:   8,
+    ..NseConfig::default()
+});
+```
+
+NSE publishes no limit and tolerance varies by IP. Measure yours with `cargo run --example stress -- [max_rate] [requests_per_step]`.
+If NSE still answers 403 after a fresh session, the client pauses all requests for 15 s instead of retrying.
+
 #### Live data
 
 | Method | Returns | Description |
 |---|---|---|
 | `get_stock_quote(symbol)` | `NseQuote` | Flat live quote for an equity (e.g. `"SBIN"`) |
 | `get_index_quote(index_name)` | `NseIndexQuote` | Spot for an index (e.g. `"NIFTY 50"`, `"NIFTY BANK"`) |
+| `get_index_quotes(&[names])` | `Vec<NseIndexQuote>` | Several indices from one request |
+| `get_all_indices()` | `Vec<NseIndexQuote>` | Every index NSE publishes, one request |
 | `get_option_chain(symbol)` | `OptionChain` | All options grouped by expiry/strike with CE+PE |
 | `get_futures(symbol)` | `Vec<DerivativeContract>` | All futures contracts |
 | `get_option_contracts(symbol)` | `Vec<DerivativeContract>` | Raw option contracts (unstructured) |
@@ -111,9 +131,9 @@ while let Some(q) = rx.recv().await {
 }
 ```
 
-`poll_index("NIFTY 50", interval_ms, tx)` works the same way for indices.
+`poll_index("NIFTY 50", interval_ms, tx)` works the same way for indices. To follow several indices use `poll_indices(&["NIFTY 50", "NIFTY BANK"], interval_ms, tx)` — one request per tick instead of one per index.
 
-Both loops stop automatically when the receiver is dropped.
+The minimum interval is 500 ms. Slow responses never trigger catch-up bursts, and errors back off exponentially (up to 60 s). Loops stop automatically when the receiver is dropped.
 
 #### Historical candles
 
@@ -132,7 +152,9 @@ let daily = client.get_historical_candles("NIFTY", start, end, "D").await?;
 
 Supported intervals: `"1"` `"3"` `"5"` `"15"` `"30"` `"60"` (minutes, max 30-day window) or `"D"` `"W"` `"M"` (unlimited history).
 
-Intraday candles are automatically filtered to 09:15–15:30 IST.
+Intraday candles are automatically filtered to 09:15–15:30 IST, so pre-open volume is excluded.
+
+**Intraday volume** is per bar. NSE's raw feed puts (roughly) the whole day's volume in the final bar of each day; the library detects that bar and replaces its volume with the day total minus the other bars, clamped at 0. Treat the last bar's volume of each day as an estimate. Summed bar volume lands close to the daily candle's volume, minus post-close session trades.
 
 #### EOD archives
 
@@ -227,7 +249,7 @@ pub struct FoBhavRecord {
 NSE's web APIs require browser cookies (`nsit`, `nseappid`, etc.) obtained by hitting their landing page. `nse-rs` handles this transparently:
 
 1. **Disk cache** at `~/.cache/nse-rs/session.json` — reused for up to 1 hour across process restarts
-2. **Auto-refresh** — if a request returns a 403 or a decode error, the session is refreshed once and the request retried automatically
+2. **Auto-refresh** — if a request returns a 401/403 or a decode error, the session is refreshed once (shared by every task that hit the same failure) and the request retried. 429, 5xx and network errors are retried up to twice with jittered backoff, without touching the session
 3. **Force refresh** — call `client.force_refresh_session().await?` to discard and re-fetch
 
 ---

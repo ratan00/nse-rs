@@ -63,7 +63,13 @@ pub fn save_session_cache(cookies: &HashMap<String, String>) -> Option<()> {
     };
     
     let serialized = serde_json::to_string_pretty(&cache).ok()?;
-    fs::write(path, serialized).ok()?;
+    // Write-then-rename so concurrent processes never read a half-written file.
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    fs::write(&tmp, serialized).ok()?;
+    if fs::rename(&tmp, &path).is_err() {
+        let _ = fs::remove_file(&tmp);
+        return None;
+    }
     Some(())
 }
 

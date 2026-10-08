@@ -97,13 +97,11 @@ pub async fn get_derivatives_quote(
         .context("derivatives decode")
 }
 
-/// Fetch LTP and OHLC for an NSE index.
-/// `index_name` is the display name as used by NSE, e.g. `"NIFTY 50"`, `"NIFTY BANK"`.
-pub async fn get_index_quote(
+/// Fetch every index NSE publishes (one request).
+pub async fn get_all_indices(
     client: &Client,
     cookies: &HashMap<String, String>,
-    index_name: &str,
-) -> Result<NseIndexQuote> {
+) -> Result<Vec<NseIndexQuote>> {
     let cookie_val = format_cookie_header(cookies);
     let url = format!("{INDEX_API_URL}?_={}", cache_buster());
     let resp: IndexApiResponse = client
@@ -119,21 +117,33 @@ pub async fn get_index_quote(
         .await
         .context("index decode")?;
 
-    let entry = resp
+    Ok(resp
         .data
         .unwrap_or_default()
         .into_iter()
-        .find(|e| e.index_symbol.eq_ignore_ascii_case(index_name))
-        .with_context(|| format!("no data for index '{index_name}'"))?;
+        .map(|entry| NseIndexQuote {
+            name:       entry.index_symbol,
+            last:       entry.last,
+            open:       entry.open,
+            high:       entry.high,
+            low:        entry.low,
+            prev_close: entry.prev_close,
+            change:     entry.change,
+            change_pct: entry.change_pct,
+        })
+        .collect())
+}
 
-    Ok(NseIndexQuote {
-        name:       entry.index_symbol,
-        last:       entry.last,
-        open:       entry.open,
-        high:       entry.high,
-        low:        entry.low,
-        prev_close: entry.prev_close,
-        change:     entry.change,
-        change_pct: entry.change_pct,
-    })
+/// Fetch LTP and OHLC for an NSE index.
+/// `index_name` is the display name as used by NSE, e.g. `"NIFTY 50"`, `"NIFTY BANK"`.
+pub async fn get_index_quote(
+    client: &Client,
+    cookies: &HashMap<String, String>,
+    index_name: &str,
+) -> Result<NseIndexQuote> {
+    get_all_indices(client, cookies)
+        .await?
+        .into_iter()
+        .find(|q| q.name.eq_ignore_ascii_case(index_name))
+        .with_context(|| format!("no data for index '{index_name}'"))
 }
