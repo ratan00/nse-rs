@@ -26,6 +26,11 @@ pub async fn fetch_symbol_list(client: &Client, date: NaiveDate) -> Result<Vec<S
         Ok(r)  => r,
         Err(_) => fetch_zipped_bhavcopy(client, date).await?,
     };
+    Ok(symbols_from_records(records))
+}
+
+/// Sorted, de-duplicated equity symbols (series EQ/BE/SM/MF) from bhavcopy records.
+pub fn symbols_from_records(records: Vec<HistoricalRecord>) -> Vec<String> {
     let mut symbols: Vec<String> = records
         .into_iter()
         .filter(|r| matches!(r.series.as_str(), "EQ" | "BE" | "SM" | "MF"))
@@ -33,7 +38,7 @@ pub async fn fetch_symbol_list(client: &Client, date: NaiveDate) -> Result<Vec<S
         .collect();
     symbols.sort();
     symbols.dedup();
-    Ok(symbols)
+    symbols
 }
 
 /// Fetch standard zipped bhavcopy (older format, no delivery data).
