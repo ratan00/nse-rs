@@ -154,7 +154,7 @@ impl NseClient {
         headers.insert("Accept",           HeaderValue::from_static("application/json, text/javascript, */*; q=0.01"));
         headers.insert("Accept-Language",  HeaderValue::from_static("en-US,en;q=0.9"));
         headers.insert("Connection",       HeaderValue::from_static("keep-alive"));
-        headers.insert("Referer",          HeaderValue::from_static("https://www.nseindia.com/"));
+        headers.insert("Referer",          HeaderValue::from_static("https://www.nseindia.in/"));
         headers.insert("X-Requested-With", HeaderValue::from_static("XMLHttpRequest"));
 
         let client = Client::builder()

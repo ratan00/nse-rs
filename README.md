@@ -339,7 +339,7 @@ NSE's web APIs require browser cookies (`nsit`, `nseappid`, etc.) obtained by hi
 
 ## ⚠️ Cloud & Geo Restrictions
 
-`www.nseindia.com` (live quotes, option chains, charting) enforces strict firewall rules:
+`www.nseindia.in` (live quotes, option chains, charting) enforces strict firewall rules:
 
 - **Geo-blocking** — requests from IPs outside India are frequently rejected with 403 or TCP resets
 - **Cloud IP blocking** — AWS, GCP, Azure, DigitalOcean and similar data-centre ranges are blocked even within India

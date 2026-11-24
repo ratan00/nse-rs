@@ -7,8 +7,8 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc, TimeZone, FixedOffset, N
 use crate::models::{ChartResponse, ChartCandle};
 use crate::session::format_cookie_header;
 
-const SEARCH_TOKEN_URL: &str   = "https://charting.nseindia.com/v1/exchanges/symbolsDynamic";
-const HISTORICAL_DATA_URL: &str = "https://charting.nseindia.com/v1/charts/symbolHistoricalData";
+const SEARCH_TOKEN_URL: &str   = "https://charting.nseindia.in/v1/exchanges/symbolsDynamic";
+const HISTORICAL_DATA_URL: &str = "https://charting.nseindia.in/v1/charts/symbolHistoricalData";
 
 /// IST = UTC+5:30 = 19800 seconds east
 const IST_OFFSET_SECS: i32 = 5 * 3600 + 30 * 60;

@@ -6,7 +6,7 @@ use reqwest::header::{HeaderValue, SET_COOKIE};
 use reqwest::Client;
 use crate::models::SessionCache;
 
-const SESSION_WARMUP_URL: &str = "https://www.nseindia.com/get-quote/equity/RELIANCE/Reliance-Industries-Limited";
+const SESSION_WARMUP_URL: &str = "https://www.nseindia.in/get-quote/equity/RELIANCE/Reliance-Industries-Limited";
 
 /// Get cache file path in standard local cache directory
 pub fn get_cache_path() -> Option<PathBuf> {
@@ -102,7 +102,7 @@ pub fn format_cookie_header(cookies: &HashMap<String, String>) -> HeaderValue {
 /// Visits the NSE India homepage first to establish the cookie jar context.
 pub async fn fetch_new_cookies(client: &Client) -> Result<HashMap<String, String>, reqwest::Error> {
     let mut cookies = HashMap::new();
-    if let Ok(resp1) = client.get("https://www.nseindia.com/").send().await {
+    if let Ok(resp1) = client.get("https://www.nseindia.in/").send().await {
         cookies.extend(extract_cookies(&resp1));
     }
     let resp2 = client.get(SESSION_WARMUP_URL).send().await?;

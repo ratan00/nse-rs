@@ -13,7 +13,7 @@ use reqwest::header::COOKIE;
 use serde::{Deserialize, Deserializer, Serialize};
 use crate::session::format_cookie_header;
 
-const FO_CPV_URL: &str = "https://www.nseindia.com/api/historicalOR/foCPV";
+const FO_CPV_URL: &str = "https://www.nseindia.in/api/historicalOR/foCPV";
 
 /// foCPV returns at most this many rows per request, keeping the most recent.
 /// A response this long may be truncated and its window must be split.
