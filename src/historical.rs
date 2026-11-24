@@ -127,7 +127,8 @@ pub async fn get_historical_candles_for_token(
 
     // NSE's charting API expects IST Unix timestamps for intraday, UTC for EOD.
     let (chart_type, time_interval, start_ts, end_ts) = if is_intraday {
-        let int_val: i32 = interval.parse().unwrap_or(3);
+        // Minutes in, seconds on the wire.
+        let int_val: i32 = interval.parse().unwrap_or(3) * 60;
         (
             "I".to_string(),
             int_val,
@@ -138,6 +139,7 @@ pub async fn get_historical_candles_for_token(
         (interval.to_string(), 1, start_time.timestamp(), end_time.timestamp())
     };
 
+    let token = chart_token(token, Utc::now());
     let cookie_val = format_cookie_header(cookies);
     let resp: ChartResponse = client
         .get(HISTORICAL_DATA_URL)
@@ -149,7 +151,7 @@ pub async fn get_historical_candles_for_token(
             ("symbolType",   symbol_type),
             ("timeInterval", &time_interval.to_string()),
             ("toDate",       &end_ts.to_string()),
-            ("token",        token),
+            ("token",        &token),
         ])
         .send()
         .await
@@ -173,6 +175,33 @@ pub async fn get_historical_candles_for_token(
     }
 
     Ok(candles)
+}
+
+/// The `token` the history endpoint takes: the scripcode with today's IST
+/// date, `"<scripcode>-<DDMMYYYY>"`, base64-encoded, the way NSE's charting
+/// page sends it. A bare scripcode is answered with no bars.
+fn chart_token(scripcode: &str, now: DateTime<Utc>) -> String {
+    let ist = FixedOffset::east_opt(IST_OFFSET_SECS).expect("valid IST offset");
+    let raw = format!("{scripcode}-{}", now.with_timezone(&ist).format("%d%m%Y"));
+    base64(raw.as_bytes())
+}
+
+/// Standard base64 with padding.
+fn base64(bytes: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ABC[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 /// IST calendar date and time of an intraday candle.
@@ -202,6 +231,8 @@ fn filter_market_hours(candles: &mut Vec<ChartCandle>) {
 /// looks like that, replace its volume with what is left after subtracting the
 /// day's other bars (clamped at 0).  The result is an estimate: NSE's day total
 /// does not line up exactly with the bars, so this bar's volume is approximate.
+/// Trailing zero-volume bars (NSE now closes the day with an empty 15:30 bar)
+/// are skipped when finding that bar.
 fn fix_day_total_bar(candles: &mut [ChartCandle]) {
     let mut start = 0;
     while start < candles.len() {
@@ -210,7 +241,11 @@ fn fix_day_total_bar(candles: &mut [ChartCandle]) {
         while end < candles.len() && candle_ist(&candles[end]).map(|dt| dt.date()) == day {
             end += 1;
         }
-        if let Some((last, others)) = candles[start..end].split_last_mut()
+        let mut last_traded = end;
+        while last_traded > start && candles[last_traded - 1].volume <= 0.0 {
+            last_traded -= 1;
+        }
+        if let Some((last, others)) = candles[start..last_traded].split_last_mut()
             && others.len() >= 2
         {
             let sum: f64 = others.iter().map(|c| c.volume).sum();
@@ -235,6 +270,30 @@ mod tests {
 
     fn candle(time: i64, volume: f64) -> ChartCandle {
         ChartCandle { time, open: 1.0, high: 1.0, low: 1.0, close: 1.0, volume }
+    }
+
+    #[test]
+    fn chart_token_is_scripcode_and_ist_date_in_base64() {
+        // 2026-11-23 20:00 UTC is already 24 Nov in IST.
+        let now = Utc.with_ymd_and_hms(2026, 11, 23, 20, 0, 0).unwrap();
+        assert_eq!(chart_token("26000", now), "MjYwMDAtMjQxMTIwMjY=");
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"2885-24112026"), "Mjg4NS0yNDExMjAyNg==");
+    }
+
+    #[test]
+    fn corrects_day_total_ahead_of_an_empty_closing_bar() {
+        let mut c = vec![
+            candle(ist_ms(2026, 11, 23, 15, 15), 300.0),
+            candle(ist_ms(2026, 11, 23, 15, 20), 400.0),
+            candle(ist_ms(2026, 11, 23, 15, 25), 5_000.0),
+            candle(ist_ms(2026, 11, 23, 15, 30), 0.0),
+        ];
+        fix_day_total_bar(&mut c);
+        assert_eq!(c.iter().map(|c| c.volume).collect::<Vec<_>>(), vec![300.0, 400.0, 4_300.0, 0.0]);
     }
 
     #[test]
