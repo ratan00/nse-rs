@@ -23,12 +23,13 @@ Provides live equity quotes, index quotes, structured option chains, futures, in
 - **Structured option chain** — `OptionChain` grouped by expiry date → strike → CE/PE
 - **Futures** — all contracts for a symbol filtered from derivatives
 - **Continuous futures** — daily front-month series stitched across expiries (expiry / days-before / OI / volume roll; ratio or difference back-adjustment), back to 2010
-- **Historical candles** — 1/3/5/15/30/60 min intraday (30-day window) or D/W/M (25+ years) for stocks, indices, live futures and options, with correct per-bar volume
+- **Historical candles** — intraday at any whole-minute interval (built from NSE's one-minute bars on the 09:15 IST grid, last ~30 days) or D/W/M (25+ years) for stocks, indices, live futures and options, with corrected per-bar volume
 - **Polling feed** — `poll_quote()`, `poll_index()` and `poll_indices()` loops with error backoff
 - **Built-in rate limiting** — paced, concurrency-capped requests with client-wide cool-down when NSE pushes back
 - **EOD bhavcopy** — equity and F&O archives parsed into typed structs
 - **Script token cache** — symbol → charting token cached in memory; repeat candle calls cost one request
 - **Auto session retry** — one shared cookie refresh on 403/decode failures, backoff on 429/5xx, disk-cached for 1 hour
+- **Fails fast and says why** — live calls time out in 10 s, a moved NSE host is reported by name (`HostMoved`), bad intervals are rejected before any request
 - **No OpenSSL** — uses `rustls` with bundled webpki roots; cross-compiles cleanly (incl. Android)
 
 ---
@@ -101,6 +102,22 @@ let client = NseClient::with_config(NseConfig {
 NSE publishes no limit and tolerance varies by IP. Measure yours with `cargo run --example stress -- [max_rate] [requests_per_step]`.
 If NSE still answers 403 after a fresh session, the client pauses all requests for 15 s instead of retrying.
 
+#### Timeouts and retries
+
+| Calls | Timeout | Retries (429 / 5xx / network) |
+|---|---|---|
+| Live: quotes, indices, derivatives / option chain, market status | `live_timeout`, default **10 s** | 1 |
+| Everything else: history, holidays, futures history, archives | `timeout`, default **45 s** | 2 |
+
+So a live call against an unreachable NSE fails in about 20 s instead of minutes; a poller simply asks again on its next tick. Both are `NseConfig` fields:
+
+```rust
+let client = NseClient::with_config(NseConfig {
+    live_timeout: std::time::Duration::from_secs(5),
+    ..NseConfig::default()
+});
+```
+
 #### Live data
 
 | Method | Returns | Description |
@@ -168,16 +185,22 @@ Symbol formats:
 
 The weekly month code is `1`–`9` for Jan–Sep, then `O`, `N`, `D`. Only **currently listed** contracts are available — NSE drops expired contracts from the charting API (use [continuous futures](#continuous-futures) for history).
 
-Supported intervals: minutes `"1"` to `"375"` (e.g. `"1"` `"3"` `"5"` `"15"` `"30"` `"60"`; about the last 30 days of sessions) or `"D"` `"W"` `"M"` (unlimited history); anything else is an error. Intraday bars are built from NSE's one-minute data on the 09:15 IST session grid, because NSE's own coarser bars are mis-stamped and repeat the day's total volume. A window that ends before `INTRADAY_HISTORY_DAYS` ago is an error.
+**Intervals:** minutes `"1"` to `"375"` (e.g. `"1"` `"3"` `"5"` `"15"` `"30"` `"60"`) or `"D"` `"W"` `"M"`. Anything else (`"1D"`, `"5m"`, `"d"`) is an error before any request is made; `Interval::parse` is public if you want to validate input yourself.
 
-Intraday candles are automatically filtered to 09:15–15:30 IST, so pre-open volume is excluded.
+**How intraday bars are built:** NSE's own bars above one minute are unreliable (older days are stamped at each bar's last trade instead of its start, the day's total volume appears in more than one bar, and a 60-minute bar can hold several times the day's turnover). So every intraday request fetches NSE's **one-minute** bars and builds the requested interval from them on the **09:15 IST session grid**: a 5-minute day reads 09:15, 09:20 … 15:25, and a 60-minute day reads 09:15, 10:15 … 15:15. Bar `time` is the bucket start, in IST-shifted epoch milliseconds.
+
+**How far back:** NSE keeps intraday bars for whole sessions from about the last 30 calendar days (`INTRADAY_HISTORY_DAYS`). A window that ends before that is an error; one that starts before it returns the sessions NSE still has. Daily, weekly and monthly go back decades.
+
+Intraday candles are automatically filtered to 09:15–15:30 IST, so pre-open and post-close trades are excluded.
 
 **Volume by instrument:**
 - **Stocks, futures, options:** real per-bar volume, in units (shares / quantity, not lots).
 - **Indices (NIFTY 50, NIFTY BANK, …):** intraday volume is always **0** — an index isn't traded. Daily candles do carry volume. For an intraday volume proxy use the near-month future.
 - **INDIA VIX:** volume 0, and charting prices come back ×100 (`1412.5` = 14.125).
 
-**Stock intraday volume:** NSE's raw feed puts (roughly) the whole day's volume in the final bar of each day; the library detects that bar and replaces its volume with the day total minus the other bars, clamped at 0. Treat the last bar's volume of each day as an estimate. Summed bar volume lands close to the daily candle's volume, minus post-close session trades.
+**Stock intraday volume:** NSE's one-minute data puts (roughly) the whole day's volume in one row near the close (15:28 or 15:29). The library finds that row by size and replaces its volume with the day total minus the day's other bars, clamped at 0, so treat the closing minute's volume as an estimate. A full day's bars sum to within a few percent of the daily candle's volume (the difference is pre-open and post-close trading).
+
+**Known gaps in NSE's data:** NSE publishes no one-minute rows for **15:16–15:19** on any stock, and older days miss a few more closing minutes, so the bars covering 15:15–15:25 are partial. Use a broker's history if you need the close complete.
 
 #### Continuous futures
 
@@ -331,15 +354,36 @@ pub struct FoBhavRecord {
 
 NSE's web APIs require browser cookies (`nsit`, `nseappid`, etc.) obtained by hitting their landing page. `nse-rs` handles this transparently:
 
-1. **Disk cache** at `~/.cache/nse-rs/session.json` — reused for up to 1 hour across process restarts
-2. **Auto-refresh** — if a request returns a 401/403 or a decode error, the session is refreshed once (shared by every task that hit the same failure) and the request retried. 429, 5xx and network errors are retried up to twice with jittered backoff, without touching the session
-3. **Force refresh** — call `client.force_refresh_session().await?` to discard and re-fetch
+1. **Disk cache** at `~/.cache/nse-rs/session.json` — reused for up to 1 hour across process restarts. Only a session that actually has cookies is written or read
+2. **Validated warm-up** — a refresh loads a quote page that must answer 2xx and set at least one cookie; if NSE refuses it with a 403 (Akamai throttling the IP), the client also pauses for 15 s
+3. **Auto-refresh** — if a request returns a 401/403 or a decode error, the session is refreshed once (shared by every task that hit the same failure) and the request retried. 429, 5xx and network errors are retried with jittered backoff (see [timeouts and retries](#timeouts-and-retries)), without touching the session
+4. **Force refresh** — call `client.force_refresh_session().await?` to discard and re-fetch
+
+---
+
+## Errors worth handling
+
+| Error | Means | What to do |
+|---|---|---|
+| `HostMoved { from, to }` (in the error chain) | NSE redirected a request to another host: it has moved domains (as `nseindia.com` → `nseindia.in` did in Nov 2026). Never retried | Update the hosts in `src/hosts.rs` (one file) |
+| `unsupported interval '…'` | Bad `interval` argument | Use minutes (`"1"`–`"375"`) or `"D"` / `"W"` / `"M"` |
+| `NSE keeps about 30 days of intraday history` | The whole window is older than NSE's intraday horizon | Use `"D"`, or a broker's history |
+| `NSE rejected the request even with a fresh session` | Still 403 after refreshing: IP throttled or blocked | Back off; see Cloud & Geo Restrictions below |
+| `no answer from NSE within …` | A live call timed out (after its one retry) | Usually the network; a poller retries on its own |
+
+```rust
+if let Err(e) = client.get_stock_quote("SBIN").await {
+    if let Some(moved) = e.chain().find_map(|c| c.downcast_ref::<nse_rs::HostMoved>()) {
+        eprintln!("NSE moved {} → {}", moved.from, moved.to);
+    }
+}
+```
 
 ---
 
 ## ⚠️ Cloud & Geo Restrictions
 
-`www.nseindia.in` (live quotes, option chains, charting) enforces strict firewall rules:
+`www.nseindia.in` and `charting.nseindia.in` (live quotes, option chains, charting) enforce strict firewall rules. (NSE moved both from `.com` to `.in` in November 2026; every host the library uses lives in `src/hosts.rs`.)
 
 - **Geo-blocking** — requests from IPs outside India are frequently rejected with 403 or TCP resets
 - **Cloud IP blocking** — AWS, GCP, Azure, DigitalOcean and similar data-centre ranges are blocked even within India
