@@ -125,13 +125,19 @@ pub async fn get_historical_candles_for_token(
         start_time
     };
 
+    // NSE's own intraday bars above one minute can't be trusted: older days
+    // are stamped at each bar's last trade instead of its start, the day's
+    // cumulative volume shows up in more than one bar, and a 60-minute bar can
+    // hold several times the day's turnover. Its one-minute bars are clean
+    // apart from a single day-total row near 15:29, so intraday is always
+    // fetched at one minute and built up to the requested interval here.
+    let minutes: i64 = if is_intraday { interval.parse::<i64>().unwrap_or(3).max(1) } else { 1 };
+
     // NSE's charting API expects IST Unix timestamps for intraday, UTC for EOD.
     let (chart_type, time_interval, start_ts, end_ts) = if is_intraday {
-        // Minutes in, seconds on the wire.
-        let int_val: i32 = interval.parse().unwrap_or(3) * 60;
         (
             "I".to_string(),
-            int_val,
+            60, // seconds
             fetch_start.timestamp() + IST_OFFSET_SECS as i64,
             end_time.timestamp()    + IST_OFFSET_SECS as i64,
         )
@@ -165,9 +171,14 @@ pub async fn get_historical_candles_for_token(
     let mut candles = resp.data.unwrap_or_default();
 
     if is_intraday {
+        let mut minute = to_minute_bars(candles);
+        // Trades after the close are not in the day total.
+        let close = NaiveTime::from_hms_opt(15, 30, 0).expect("valid time");
+        minute.retain(|c| candle_ist(c).is_some_and(|dt| dt.time() < close));
         // Before the market-hours filter: the day total includes pre-open volume.
-        fix_day_total_bar(&mut candles);
-        filter_market_hours(&mut candles);
+        fix_day_total_bar(&mut minute);
+        filter_market_hours(&mut minute);
+        candles = resample(&minute, minutes);
         if fetch_start < start_time {
             let requested_from_ms = (start_time.timestamp() + IST_OFFSET_SECS as i64) * 1000;
             candles.retain(|c| c.time >= requested_from_ms);
@@ -204,6 +215,57 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
+/// One bar per minute, stamped at the minute's start. Older days come stamped
+/// at the bar's last trade (09:15:55 for the 09:15 minute): floor them, and
+/// fold any rows that land on the same minute (an exact repeat is dropped).
+fn to_minute_bars(mut rows: Vec<ChartCandle>) -> Vec<ChartCandle> {
+    for c in &mut rows {
+        c.time -= c.time.rem_euclid(60_000);
+    }
+    rows.sort_by_key(|c| c.time);
+    let mut out: Vec<ChartCandle> = Vec::with_capacity(rows.len());
+    for c in rows {
+        match out.last_mut() {
+            Some(p) if p.time == c.time => {
+                if (p.open, p.high, p.low, p.close, p.volume) != (c.open, c.high, c.low, c.close, c.volume) {
+                    merge_into(p, &c);
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// One-minute bars into `minutes`-minute bars on the session grid (09:15 IST
+/// onward, so a 60-minute day reads 09:15, 10:15, … 15:15).
+fn resample(bars: &[ChartCandle], minutes: i64) -> Vec<ChartCandle> {
+    if minutes <= 1 {
+        return bars.to_vec();
+    }
+    const OPEN_MS: i64 = (9 * 3600 + 15 * 60) * 1000;
+    let step = minutes * 60_000;
+    let mut out: Vec<ChartCandle> = Vec::new();
+    for c in bars {
+        // `time` is IST-shifted, so whole days are IST midnights.
+        let anchor = c.time - c.time.rem_euclid(86_400_000) + OPEN_MS;
+        let bucket = anchor + (c.time - anchor).div_euclid(step) * step;
+        match out.last_mut() {
+            Some(p) if p.time == bucket => merge_into(p, c),
+            _ => out.push(ChartCandle { time: bucket, ..c.clone() }),
+        }
+    }
+    out
+}
+
+/// `c` comes after `into` in time: extend `into` by it.
+fn merge_into(into: &mut ChartCandle, c: &ChartCandle) {
+    into.high = into.high.max(c.high);
+    into.low = into.low.min(c.low);
+    into.close = c.close;
+    into.volume += c.volume;
+}
+
 /// IST calendar date and time of an intraday candle.
 /// `c.time` is IST-shifted epoch milliseconds: `(real_utc + IST_OFFSET_SECS) * 1000`.
 fn candle_ist(c: &ChartCandle) -> Option<chrono::NaiveDateTime> {
@@ -225,14 +287,15 @@ fn filter_market_hours(candles: &mut Vec<ChartCandle>) {
     });
 }
 
-/// NSE's intraday volume is per bar, except that the final bar of each day
-/// carries (roughly) the whole day's volume — e.g. a 5-min SBIN session whose
+/// NSE's intraday volume is per bar, except that one bar near the end of each
+/// day carries (roughly) the whole day's volume — e.g. a 5-min SBIN session whose
 /// regular bars peak at ~0.35M ends with a 7.27M bar.  When a day's last bar
-/// looks like that, replace its volume with what is left after subtracting the
-/// day's other bars (clamped at 0).  The result is an estimate: NSE's day total
+/// looks like that (the day's largest bar, at least half the rest of the day
+/// and over three times any other bar), replace its volume with what is left
+/// after subtracting the day's other bars (clamped at 0).  The result is an estimate: NSE's day total
 /// does not line up exactly with the bars, so this bar's volume is approximate.
-/// Trailing zero-volume bars (NSE now closes the day with an empty 15:30 bar)
-/// are skipped when finding that bar.
+/// It is found by size, not position: NSE has put it before an empty 15:30
+/// bar and, in one-minute data, at 15:28 or 15:29.
 fn fix_day_total_bar(candles: &mut [ChartCandle]) {
     let mut start = 0;
     while start < candles.len() {
@@ -241,17 +304,17 @@ fn fix_day_total_bar(candles: &mut [ChartCandle]) {
         while end < candles.len() && candle_ist(&candles[end]).map(|dt| dt.date()) == day {
             end += 1;
         }
-        let mut last_traded = end;
-        while last_traded > start && candles[last_traded - 1].volume <= 0.0 {
-            last_traded -= 1;
-        }
-        if let Some((last, others)) = candles[start..last_traded].split_last_mut()
-            && others.len() >= 2
-        {
-            let sum: f64 = others.iter().map(|c| c.volume).sum();
-            let max = others.iter().map(|c| c.volume).fold(0.0, f64::max);
-            if last.volume >= 0.5 * sum && last.volume > 3.0 * max {
-                last.volume = (last.volume - sum).max(0.0);
+        let day = &mut candles[start..end];
+        if day.len() >= 3 {
+            let big = (0..day.len()).fold(0, |b, i| if day[i].volume > day[b].volume { i } else { b });
+            let total = day[big].volume;
+            let (sum, max) = day
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != big)
+                .fold((0.0, 0.0f64), |(s, m), (_, c)| (s + c.volume, m.max(c.volume)));
+            if total >= 0.5 * sum && total > 3.0 * max {
+                day[big].volume = (total - sum).max(0.0);
             }
         }
         start = end;
@@ -282,6 +345,52 @@ mod tests {
         assert_eq!(base64(b"fo"), "Zm8=");
         assert_eq!(base64(b"foo"), "Zm9v");
         assert_eq!(base64(b"2885-24112026"), "Mjg4NS0yNDExMjAyNg==");
+    }
+
+    #[test]
+    fn minute_bars_are_floored_and_repeats_dropped() {
+        let at = |h, m, s: i64| ist_ms(2026, 11, 20, h, m) + s * 1000;
+        let c = |time, o: f64, cl: f64, v| ChartCandle { time, open: o, high: o.max(cl), low: o.min(cl), close: cl, volume: v };
+        let rows = vec![
+            c(at(9, 16, 59), 3.0, 4.0, 20.0),
+            c(at(9, 15, 55), 1.0, 2.0, 10.0),
+            c(at(15, 28, 10), 5.0, 5.0, 900.0),
+            c(at(15, 28, 49), 5.0, 5.0, 900.0), // the same row again
+        ];
+        let m = to_minute_bars(rows);
+        assert_eq!(m.iter().map(|c| c.time).collect::<Vec<_>>(), vec![at(9, 15, 0), at(9, 16, 0), at(15, 28, 0)]);
+        assert_eq!(m[2].volume, 900.0);
+    }
+
+    #[test]
+    fn resamples_on_the_session_grid() {
+        let c = |h, m, v| ChartCandle { time: ist_ms(2026, 11, 23, h, m), open: v, high: v, low: v, close: v, volume: v };
+        let bars = vec![c(9, 15, 1.0), c(9, 19, 2.0), c(9, 20, 3.0), c(10, 14, 4.0), c(10, 15, 5.0)];
+        let five = resample(&bars, 5);
+        assert_eq!(five.iter().map(|b| (b.time, b.volume)).collect::<Vec<_>>(), vec![
+            (ist_ms(2026, 11, 23, 9, 15), 3.0),
+            (ist_ms(2026, 11, 23, 9, 20), 3.0),
+            (ist_ms(2026, 11, 23, 10, 10), 4.0),
+            (ist_ms(2026, 11, 23, 10, 15), 5.0),
+        ]);
+        assert_eq!((five[0].open, five[0].high, five[0].low, five[0].close), (1.0, 2.0, 1.0, 2.0));
+        let hour = resample(&bars, 60);
+        assert_eq!(hour.iter().map(|b| (b.time, b.volume)).collect::<Vec<_>>(), vec![
+            (ist_ms(2026, 11, 23, 9, 15), 10.0),
+            (ist_ms(2026, 11, 23, 10, 15), 5.0),
+        ]);
+    }
+
+    #[test]
+    fn day_total_found_by_size_not_position() {
+        let mut c = vec![
+            candle(ist_ms(2026, 11, 20, 15, 26), 300.0),
+            candle(ist_ms(2026, 11, 20, 15, 27), 400.0),
+            candle(ist_ms(2026, 11, 20, 15, 28), 5_000.0),
+            candle(ist_ms(2026, 11, 20, 15, 29), 50.0),
+        ];
+        fix_day_total_bar(&mut c);
+        assert_eq!(c.iter().map(|c| c.volume).collect::<Vec<_>>(), vec![300.0, 400.0, 4_250.0, 50.0]);
     }
 
     #[test]
