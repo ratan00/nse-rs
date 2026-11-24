@@ -3,8 +3,9 @@ use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use chrono::NaiveDate;
 use crate::models::{HistoricalRecord, FoBhavRecord};
+use crate::hosts::archives;
 
-const BASE_ARCHIVES_URL: &str = "https://nsearchives.nseindia.com";
+const BASE_ARCHIVES_URL: &str = archives!("");
 
 /// Fetch full bhavcopy CSV (includes delivery data).
 pub async fn fetch_full_bhavcopy(

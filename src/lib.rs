@@ -1,3 +1,4 @@
+mod hosts;
 pub mod models;
 pub mod session;
 pub mod live;
@@ -8,7 +9,7 @@ pub mod holidays;
 pub mod ratelimit;
 pub mod futures;
 
-pub use client::{NseClient, NseConfig, MIN_POLL_INTERVAL_MS};
+pub use client::{HostMoved, NseClient, NseConfig, MIN_POLL_INTERVAL_MS};
 pub use holidays::{NseHoliday, TradingHolidays};
 pub use futures::{
     Adjustment, ContinuousBar, ContinuousFutures, ContinuousOptions, FuturesDailyRecord, RollEvent, RollRule,

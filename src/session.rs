@@ -5,8 +5,9 @@ use chrono::Utc;
 use reqwest::header::{HeaderValue, SET_COOKIE};
 use reqwest::Client;
 use crate::models::SessionCache;
+use crate::hosts::www;
 
-const SESSION_WARMUP_URL: &str = "https://www.nseindia.in/get-quote/equity/RELIANCE/Reliance-Industries-Limited";
+const SESSION_WARMUP_URL: &str = www!("/get-quote/equity/RELIANCE/Reliance-Industries-Limited");
 
 /// Get cache file path in standard local cache directory
 pub fn get_cache_path() -> Option<PathBuf> {
@@ -38,6 +39,9 @@ pub fn load_session_cache() -> Option<SessionCache> {
     
     let content = fs::read_to_string(path).ok()?;
     let cache: SessionCache = serde_json::from_str(&content).ok()?;
+    if cache.cookies.is_empty() {
+        return None;
+    }
     
     // Check if session has expired (TTL of 1 hour)
     let elapsed = Utc::now() - cache.updated_on;
@@ -50,6 +54,10 @@ pub fn load_session_cache() -> Option<SessionCache> {
 
 /// Save session cache to disk
 pub fn save_session_cache(cookies: &HashMap<String, String>) -> Option<()> {
+    // An empty session would only make the next process start without one.
+    if cookies.is_empty() {
+        return None;
+    }
     let path = get_cache_path()?;
     
     // Ensure parent directory exists
@@ -99,13 +107,17 @@ pub fn format_cookie_header(cookies: &HashMap<String, String>) -> HeaderValue {
 }
 
 /// Helper to request cookies from the landing page.
-/// Visits the NSE India homepage first to establish the cookie jar context.
-pub async fn fetch_new_cookies(client: &Client) -> Result<HashMap<String, String>, reqwest::Error> {
+/// Visits the NSE India homepage first to establish the cookie jar context
+/// (it answers 403 to clients without JavaScript, but may still set cookies).
+/// The warm-up page must load and set at least one cookie: a blocked or empty
+/// answer is an error rather than a session, so it is never cached.
+pub async fn fetch_new_cookies(client: &Client) -> anyhow::Result<HashMap<String, String>> {
     let mut cookies = HashMap::new();
-    if let Ok(resp1) = client.get("https://www.nseindia.in/").send().await {
+    if let Ok(resp1) = client.get(www!("/")).send().await {
         cookies.extend(extract_cookies(&resp1));
     }
-    let resp2 = client.get(SESSION_WARMUP_URL).send().await?;
+    let resp2 = client.get(SESSION_WARMUP_URL).send().await?.error_for_status()?;
     cookies.extend(extract_cookies(&resp2));
+    anyhow::ensure!(!cookies.is_empty(), "NSE set no session cookies");
     Ok(cookies)
 }

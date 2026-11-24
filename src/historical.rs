@@ -6,9 +6,10 @@ use serde::Deserialize;
 use chrono::{DateTime, Duration as ChronoDuration, Utc, TimeZone, FixedOffset, NaiveTime};
 use crate::models::{ChartResponse, ChartCandle};
 use crate::session::format_cookie_header;
+use crate::hosts::charting;
 
-const SEARCH_TOKEN_URL: &str   = "https://charting.nseindia.in/v1/exchanges/symbolsDynamic";
-const HISTORICAL_DATA_URL: &str = "https://charting.nseindia.in/v1/charts/symbolHistoricalData";
+const SEARCH_TOKEN_URL: &str   = charting!("/v1/exchanges/symbolsDynamic");
+const HISTORICAL_DATA_URL: &str = charting!("/v1/charts/symbolHistoricalData");
 
 /// IST = UTC+5:30 = 19800 seconds east
 const IST_OFFSET_SECS: i32 = 5 * 3600 + 30 * 60;
@@ -78,10 +79,43 @@ pub async fn get_script_token(
     bail!("symbol '{symbol}' not found in NSE charting search")
 }
 
+/// How far back NSE serves intraday bars: whole sessions from about this many
+/// calendar days ago. A window reaching further back gets only what is left.
+pub const INTRADAY_HISTORY_DAYS: i64 = 30;
+
+/// A parsed `interval` argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Interval {
+    /// Intraday bars of this many minutes (1 to 375, one session).
+    Minutes(i64),
+    /// `"D"`, `"W"` or `"M"`.
+    Eod(&'static str),
+}
+
+impl Interval {
+    /// `"1"`, `"5"`, `"60"` … (minutes) or `"D"`, `"W"`, `"M"`. Anything else is
+    /// an error rather than a guess.
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "D" => return Ok(Interval::Eod("D")),
+            "W" => return Ok(Interval::Eod("W")),
+            "M" => return Ok(Interval::Eod("M")),
+            _ => {}
+        }
+        match s.parse::<i64>() {
+            Ok(m) if (1..=375).contains(&m) => Ok(Interval::Minutes(m)),
+            _ => bail!("unsupported interval '{s}': minutes (\"1\" to \"375\") or \"D\", \"W\", \"M\""),
+        }
+    }
+}
+
 /// Fetch historical candles.
-/// `interval` is `"1"`, `"3"`, `"5"`, `"15"`, `"30"`, `"60"` (minutes) or `"D"`, `"W"`, `"M"`.
+/// `interval` is minutes (`"1"`, `"3"`, `"5"`, `"15"`, `"30"`, `"60"`, … up to
+/// `"375"`) or `"D"`, `"W"`, `"M"`; anything else is an error.
 /// Intraday candles are filtered to market hours (09:15–15:30 IST); volume is per bar
-/// (see [`fix_day_total_bar`] for the one correction applied).
+/// (see [`fix_day_total_bar`] for the one correction applied). Intraday history
+/// goes back [`INTRADAY_HISTORY_DAYS`]: a window that ends before that is an
+/// error, one that starts before it gets the sessions NSE still has.
 pub async fn get_historical_candles(
     client: &Client,
     cookies: &HashMap<String, String>,
@@ -106,14 +140,19 @@ pub async fn get_historical_candles_for_token(
 ) -> Result<Vec<ChartCandle>> {
     let (real_symbol, token, symbol_type) = token;
 
-    let is_intraday = !matches!(interval, "D" | "W" | "M");
+    let parsed = Interval::parse(interval)?;
+    let is_intraday = matches!(parsed, Interval::Minutes(_));
     let ist_tz = FixedOffset::east_opt(IST_OFFSET_SECS).expect("valid IST offset");
 
-    // Correcting each day's final bar (see `fix_day_total_bar`) needs every bar
-    // of that day, so fetch from the start of the first IST day and trim
-    // afterwards.  Skipped for windows near NSE's 30-day intraday limit so
-    // widening cannot exceed it.
-    let fetch_start = if is_intraday && end_time - start_time <= ChronoDuration::days(29) {
+    if is_intraday && end_time < Utc::now() - ChronoDuration::days(INTRADAY_HISTORY_DAYS) {
+        bail!("NSE keeps about {INTRADAY_HISTORY_DAYS} days of intraday history; {start_time}..{end_time} is older");
+    }
+
+    // Correcting each day's day-total bar (see `fix_day_total_bar`) needs
+    // every bar of that day, so fetch from the start of the first IST day and
+    // trim afterwards. NSE cuts its intraday history by whole sessions, so
+    // widening never asks for a day it would only half serve.
+    let fetch_start = if is_intraday {
         start_time
             .with_timezone(&ist_tz)
             .date_naive()
@@ -131,7 +170,10 @@ pub async fn get_historical_candles_for_token(
     // hold several times the day's turnover. Its one-minute bars are clean
     // apart from a single day-total row near 15:29, so intraday is always
     // fetched at one minute and built up to the requested interval here.
-    let minutes: i64 = if is_intraday { interval.parse::<i64>().unwrap_or(3).max(1) } else { 1 };
+    let minutes: i64 = match parsed {
+        Interval::Minutes(m) => m,
+        Interval::Eod(_) => 1,
+    };
 
     // NSE's charting API expects IST Unix timestamps for intraday, UTC for EOD.
     let (chart_type, time_interval, start_ts, end_ts) = if is_intraday {
@@ -345,6 +387,36 @@ mod tests {
         assert_eq!(base64(b"fo"), "Zm8=");
         assert_eq!(base64(b"foo"), "Zm9v");
         assert_eq!(base64(b"2885-24112026"), "Mjg4NS0yNDExMjAyNg==");
+    }
+
+    #[test]
+    fn intervals_parse_or_fail_loudly() {
+        assert_eq!(Interval::parse("1").unwrap(), Interval::Minutes(1));
+        assert_eq!(Interval::parse("60").unwrap(), Interval::Minutes(60));
+        assert_eq!(Interval::parse("375").unwrap(), Interval::Minutes(375));
+        assert_eq!(Interval::parse("D").unwrap(), Interval::Eod("D"));
+        assert_eq!(Interval::parse("M").unwrap(), Interval::Eod("M"));
+        for bad in ["", "0", "-5", "376", "1D", "5m", "d", "1.5"] {
+            assert!(Interval::parse(bad).is_err(), "{bad:?} accepted");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_interval_typo_fails_before_any_request() {
+        let client = Client::new();
+        let token = ("X".to_string(), "1".to_string(), "Equity".to_string());
+        let now = Utc::now();
+        let err = get_historical_candles_for_token(&client, &HashMap::new(), &token, now - ChronoDuration::days(1), now, "1D").await.unwrap_err();
+        assert!(err.to_string().contains("unsupported interval '1D'"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn a_window_older_than_the_horizon_is_an_error() {
+        let client = Client::new();
+        let token = ("X".to_string(), "1".to_string(), "Equity".to_string());
+        let end = Utc::now() - ChronoDuration::days(INTRADAY_HISTORY_DAYS + 5);
+        let err = get_historical_candles_for_token(&client, &HashMap::new(), &token, end - ChronoDuration::days(3), end, "5").await.unwrap_err();
+        assert!(err.to_string().contains("intraday history"), "{err:#}");
     }
 
     #[test]
