@@ -6,10 +6,11 @@ use crate::models::{
     NextApiQuoteResponse, NextApiDerivativesResponse, IndexApiResponse, NseIndexQuote,
 };
 use crate::session::format_cookie_header;
+use crate::hosts::www;
 
-const NEXT_API_URL: &str    = "https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi";
-const MARKET_STATUS_URL: &str = "https://www.nseindia.com/api/marketStatus";
-const INDEX_API_URL: &str   = "https://www.nseindia.com/api/allIndices";
+const NEXT_API_URL: &str    = www!("/api/NextApi/apiClient/GetQuoteApi");
+const MARKET_STATUS_URL: &str = www!("/api/marketStatus");
+const INDEX_API_URL: &str   = www!("/api/allIndices");
 
 /// Millisecond epoch string used as a `_=` query param to defeat NSE's
 /// CDN/server response cache — without it these endpoints return a stale

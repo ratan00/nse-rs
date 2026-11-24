@@ -17,6 +17,7 @@ use crate::ratelimit::{backoff, RateLimiter};
 use crate::session::{load_session_cache, save_session_cache, fetch_new_cookies};
 use crate::{live, historical, archives, futures};
 use crate::futures::{ContinuousFutures, ContinuousOptions, FuturesDailyRecord, FO_CPV_ROW_CAP};
+use crate::hosts::www;
 
 /// How long a `get_derivatives_quote` response is reused.
 const DERIV_TTL: Duration = Duration::from_secs(2);
@@ -25,6 +26,9 @@ const DERIV_EVICT_AFTER: Duration = Duration::from_secs(60);
 
 /// Retries for 429 / 5xx / network errors (session failures get one refresh instead).
 const MAX_RETRIES: u32 = 2;
+/// Live calls (quotes, indices, derivatives, market status) retry once: a
+/// poller asks again in a second anyway, and a stale answer is worth little.
+const LIVE_RETRIES: u32 = 1;
 const RETRY_BASE: Duration = Duration::from_millis(500);
 const RETRY_MAX: Duration = Duration::from_secs(10);
 /// Pause applied to the whole client when NSE still answers 403 with fresh cookies —
@@ -78,8 +82,12 @@ pub struct NseConfig {
     pub requests_per_sec: f64,
     /// Maximum requests in flight at once.
     pub max_concurrent: usize,
-    /// Per-request timeout.
+    /// Per-request timeout for history, archives and other bulk calls.
     pub timeout: Duration,
+    /// Per-request timeout for live calls (quotes, indices, derivatives,
+    /// market status), which retry once instead of twice. A live call that
+    /// cannot reach NSE fails within about twice this.
+    pub live_timeout: Duration,
 }
 
 impl Default for NseConfig {
@@ -88,6 +96,7 @@ impl Default for NseConfig {
             requests_per_sec: 3.0,
             max_concurrent:   4,
             timeout:          Duration::from_secs(45),
+            live_timeout:     Duration::from_secs(10),
         }
     }
 }
@@ -98,6 +107,58 @@ impl Default for NseConfig {
 struct Session {
     generation: u64,
     cookies:    HashMap<String, String>,
+}
+
+/// A live call that outlasted [`NseConfig::live_timeout`].
+#[derive(Debug)]
+struct LiveTimeout(Duration);
+
+impl std::fmt::Display for LiveTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no answer from NSE within {:?}", self.0)
+    }
+}
+
+impl std::error::Error for LiveTimeout {}
+
+/// A redirect to another host: NSE has moved, and the session cookies (sent
+/// as a header, which a cross-host redirect drops) would not follow anyway.
+#[derive(Debug)]
+pub struct HostMoved {
+    pub from: String,
+    pub to: String,
+}
+
+impl std::fmt::Display for HostMoved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NSE redirected {} to {}: its host has moved (update nse-rs `hosts`)", self.from, self.to)
+    }
+}
+
+impl std::error::Error for HostMoved {}
+
+/// The redirect policy: follow up to 10 hops on the same host, refuse any hop
+/// to another host with [`HostMoved`].
+fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let from = attempt.previous().first().and_then(|u| u.host_str()).unwrap_or_default().to_string();
+        let to = attempt.url().host_str().unwrap_or_default().to_string();
+        if from != to {
+            attempt.error(HostMoved { from, to })
+        } else if attempt.previous().len() > 10 {
+            attempt.error("too many redirects")
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
+/// Retry budget and timeout of one kind of call.
+#[derive(Debug, Clone, Copy)]
+struct Budget {
+    retries: u32,
+    /// `None`: the client's own timeout.
+    timeout: Option<Duration>,
 }
 
 /// How a failed request should be handled.
@@ -115,7 +176,14 @@ enum Failure {
 
 fn classify(err: &anyhow::Error) -> Failure {
     for cause in err.chain() {
+        if cause.is::<LiveTimeout>() {
+            return Failure::Transient;
+        }
         if let Some(e) = cause.downcast_ref::<reqwest::Error>() {
+            // A moved host: retrying or refreshing the session cannot help.
+            if e.is_redirect() {
+                return Failure::Fatal;
+            }
             if let Some(status) = e.status() {
                 return match status.as_u16() {
                     401 | 403 => Failure::Session,
@@ -139,6 +207,8 @@ pub struct NseClient {
     /// Serialises session refreshes so a burst of 403s causes one refresh.
     refresh_lock:  tokio::sync::Mutex<()>,
     limiter:       RateLimiter,
+    live:          Budget,
+    bulk:          Budget,
     /// In-memory cache: NSE symbol (uppercase) → charting token triple.
     token_cache:   RwLock<HashMap<String, TokenEntry>>,
 }
@@ -154,7 +224,7 @@ impl NseClient {
         headers.insert("Accept",           HeaderValue::from_static("application/json, text/javascript, */*; q=0.01"));
         headers.insert("Accept-Language",  HeaderValue::from_static("en-US,en;q=0.9"));
         headers.insert("Connection",       HeaderValue::from_static("keep-alive"));
-        headers.insert("Referer",          HeaderValue::from_static("https://www.nseindia.com/"));
+        headers.insert("Referer",          HeaderValue::from_static(www!("/")));
         headers.insert("X-Requested-With", HeaderValue::from_static("XMLHttpRequest"));
 
         let client = Client::builder()
@@ -162,6 +232,7 @@ impl NseClient {
             .cookie_store(true)
             .connect_timeout(Duration::from_secs(10))
             .timeout(config.timeout)
+            .redirect(redirect_policy())
             .build()
             .unwrap_or_default();
 
@@ -170,6 +241,8 @@ impl NseClient {
             session:      RwLock::new(Session::default()),
             refresh_lock: tokio::sync::Mutex::new(()),
             limiter:      RateLimiter::new(config.requests_per_sec, config.max_concurrent),
+            live:         Budget { retries: LIVE_RETRIES, timeout: Some(config.live_timeout) },
+            bulk:         Budget { retries: MAX_RETRIES, timeout: None },
             token_cache:  RwLock::new(HashMap::new()),
         }
     }
@@ -237,13 +310,36 @@ impl NseClient {
         F: Fn(Client, HashMap<String, String>) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
+        self.request_with(self.bulk, f).await
+    }
+
+    /// [`Self::request`] for a live call: shorter timeout, one retry.
+    async fn request_live<F, Fut, T>(&self, f: F) -> Result<T>
+    where
+        F: Fn(Client, HashMap<String, String>) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        self.request_with(self.live, f).await
+    }
+
+    async fn request_with<F, Fut, T>(&self, budget: Budget, f: F) -> Result<T>
+    where
+        F: Fn(Client, HashMap<String, String>) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
         let mut refreshed = false;
         let mut attempt = 0;
         loop {
             let (generation, cookies) = self.snapshot();
             let result = {
                 let _permit = self.limiter.acquire().await;
-                f(self.client.clone(), cookies).await
+                let call = f(self.client.clone(), cookies);
+                match budget.timeout {
+                    Some(t) => tokio::time::timeout(t, call)
+                        .await
+                        .unwrap_or_else(|_| Err(anyhow::Error::new(LiveTimeout(t)))),
+                    None => call.await,
+                }
             };
             let err = match result {
                 Ok(v) => return Ok(v),
@@ -252,7 +348,14 @@ impl NseClient {
             match classify(&err) {
                 Failure::Session if !refreshed => {
                     refreshed = true;
-                    self.refresh_session_after(generation).await?;
+                    if let Err(e) = self.refresh_session_after(generation).await {
+                        // The warm-up page itself refused us: Akamai is
+                        // throttling the IP, so back off as for a second 403.
+                        if classify(&e) == Failure::Session {
+                            self.limiter.cool_down(BLOCKED_COOLDOWN).await;
+                        }
+                        return Err(e.context(format!("after: {err:#}")));
+                    }
                 }
                 Failure::Session => {
                     self.limiter.cool_down(BLOCKED_COOLDOWN).await;
@@ -260,11 +363,11 @@ impl NseClient {
                         "NSE rejected the request even with a fresh session (likely rate-limited)",
                     ));
                 }
-                Failure::Throttled if attempt < MAX_RETRIES => {
+                Failure::Throttled if attempt < budget.retries => {
                     self.limiter.cool_down(backoff(RETRY_BASE, attempt, RETRY_MAX)).await;
                     attempt += 1;
                 }
-                Failure::Transient if attempt < MAX_RETRIES => {
+                Failure::Transient if attempt < budget.retries => {
                     sleep(backoff(RETRY_BASE, attempt, RETRY_MAX)).await;
                     attempt += 1;
                 }
@@ -278,7 +381,7 @@ impl NseClient {
     /// Raw NextApi response for an equity symbol.
     pub async fn get_stock_quote_raw(&self, symbol: &str) -> Result<NextApiQuoteResponse> {
         let sym = symbol.to_string();
-        self.request(|client, c| {
+        self.request_live(|client, c| {
             let sym = sym.clone();
             async move { live::get_stock_quote(&client, &c, &sym).await }
         })
@@ -298,7 +401,7 @@ impl NseClient {
     /// Quote for an NSE index (e.g. `"NIFTY 50"`, `"NIFTY BANK"`).
     pub async fn get_index_quote(&self, index_name: &str) -> Result<NseIndexQuote> {
         let name = index_name.to_string();
-        self.request(|client, c| {
+        self.request_live(|client, c| {
             let name = name.clone();
             async move { live::get_index_quote(&client, &c, &name).await }
         })
@@ -307,7 +410,7 @@ impl NseClient {
 
     /// Every index NSE publishes, from a single request.
     pub async fn get_all_indices(&self) -> Result<Vec<NseIndexQuote>> {
-        self.request(|client, c| async move { live::get_all_indices(&client, &c).await })
+        self.request_live(|client, c| async move { live::get_all_indices(&client, &c).await })
             .await
     }
 
@@ -347,7 +450,7 @@ impl NseClient {
         // Cache on success regardless of data freshness
         // (NSE returns stale prev-close data outside market hours; we still cache it).
         let sym = symbol.to_string();
-        let resp = self.request(|client, c| {
+        let resp = self.request_live(|client, c| {
             let sym = sym.clone();
             async move { live::get_derivatives_quote(&client, &c, &sym).await }
         }).await?;
@@ -400,6 +503,9 @@ impl NseClient {
         end_time: chrono::DateTime<chrono::Utc>,
         interval: &str,
     ) -> Result<Vec<ChartCandle>> {
+        // A bad interval is the caller's mistake: fail before any request, and
+        // without dropping the symbol's cached token.
+        historical::Interval::parse(interval)?;
         let key = symbol.to_uppercase();
         let cached = self.token_cache.read().unwrap_or_else(|e| e.into_inner()).get(&key).cloned();
         let token = match cached {
@@ -572,7 +678,7 @@ impl NseClient {
     // ── Market status ─────────────────────────────────────────────────────────
 
     pub async fn get_market_status(&self) -> Result<crate::models::MarketStatusResponse> {
-        self.request(|client, c| async move { live::get_market_status(&client, &c).await })
+        self.request_live(|client, c| async move { live::get_market_status(&client, &c).await })
             .await
     }
 
@@ -634,5 +740,74 @@ mod tests {
     #[test]
     fn non_http_errors_are_fatal() {
         assert_eq!(classify(&anyhow::anyhow!("no data for index 'FOO'")), Failure::Fatal);
+    }
+
+    #[test]
+    fn a_live_timeout_is_retried() {
+        let e = anyhow::Error::new(LiveTimeout(Duration::from_secs(10))).context("quote");
+        assert_eq!(classify(&e), Failure::Transient);
+    }
+
+    /// A one-shot HTTP server answering every connection with `response`.
+    async fn serve(response: &'static str) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(response.as_bytes()).await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_another_host_is_refused_by_name() {
+        let addr = serve("HTTP/1.1 301 Moved\r\nLocation: http://nse.invalid/api\r\nContent-Length: 0\r\n\r\n").await;
+        let client = Client::builder().redirect(redirect_policy()).build().unwrap();
+        let err = client.get(format!("http://{addr}/api")).send().await.unwrap_err();
+        assert!(err.is_redirect());
+        let err = anyhow::Error::new(err);
+        assert_eq!(classify(&err), Failure::Fatal);
+        let moved = err.chain().find_map(|c| c.downcast_ref::<HostMoved>()).expect("HostMoved in the chain");
+        assert_eq!((moved.from.as_str(), moved.to.as_str()), ("127.0.0.1", "nse.invalid"));
+    }
+
+    #[tokio::test]
+    async fn a_same_host_redirect_is_followed() {
+        let addr = serve("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+        let hop = serve(Box::leak(format!("HTTP/1.1 302 Found\r\nLocation: http://{addr}/b\r\nContent-Length: 0\r\n\r\n").into_boxed_str())).await;
+        let client = Client::builder().redirect(redirect_policy()).build().unwrap();
+        // Different ports, same host: still NSE.
+        let body = client.get(format!("http://{hop}/a")).send().await.unwrap().text().await.unwrap();
+        assert_eq!(body, "ok");
+    }
+
+    #[tokio::test]
+    async fn a_live_call_gives_up_after_its_timeout_and_one_retry() {
+        // Accepts and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        let nse = NseClient::with_config(NseConfig { live_timeout: Duration::from_millis(200), ..NseConfig::default() });
+        let started = Instant::now();
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let err = nse
+            .request_live(|client, _| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move { Ok(client.get(format!("http://{addr}/")).send().await?.text().await?) }
+            })
+            .await
+            .unwrap_err();
+        assert!(err.chain().any(|c| c.is::<LiveTimeout>()), "{err:#}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1 + LIVE_RETRIES);
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
     }
 }

@@ -168,7 +168,7 @@ Symbol formats:
 
 The weekly month code is `1`–`9` for Jan–Sep, then `O`, `N`, `D`. Only **currently listed** contracts are available — NSE drops expired contracts from the charting API (use [continuous futures](#continuous-futures) for history).
 
-Supported intervals: `"1"` `"3"` `"5"` `"15"` `"30"` `"60"` (minutes, max 30-day window) or `"D"` `"W"` `"M"` (unlimited history).
+Supported intervals: minutes `"1"` to `"375"` (e.g. `"1"` `"3"` `"5"` `"15"` `"30"` `"60"`; about the last 30 days of sessions) or `"D"` `"W"` `"M"` (unlimited history); anything else is an error. Intraday bars are built from NSE's one-minute data on the 09:15 IST session grid, because NSE's own coarser bars are mis-stamped and repeat the day's total volume. A window that ends before `INTRADAY_HISTORY_DAYS` ago is an error.
 
 Intraday candles are automatically filtered to 09:15–15:30 IST, so pre-open volume is excluded.
 
@@ -339,7 +339,7 @@ NSE's web APIs require browser cookies (`nsit`, `nseappid`, etc.) obtained by hi
 
 ## ⚠️ Cloud & Geo Restrictions
 
-`www.nseindia.com` (live quotes, option chains, charting) enforces strict firewall rules:
+`www.nseindia.in` (live quotes, option chains, charting) enforces strict firewall rules:
 
 - **Geo-blocking** — requests from IPs outside India are frequently rejected with 403 or TCP resets
 - **Cloud IP blocking** — AWS, GCP, Azure, DigitalOcean and similar data-centre ranges are blocked even within India

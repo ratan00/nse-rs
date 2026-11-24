@@ -8,8 +8,9 @@ use reqwest::Client;
 use serde::Deserialize;
 
 use crate::session::format_cookie_header;
+use crate::hosts::www;
 
-const HOLIDAY_URL: &str = "https://www.nseindia.com/api/holiday-master?type=trading";
+const HOLIDAY_URL: &str = www!("/api/holiday-master?type=trading");
 
 /// One trading holiday.
 #[derive(Debug, Clone, PartialEq, Eq)]
